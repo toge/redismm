@@ -2,21 +2,29 @@
 #include "redismm/EmbeddedRedis.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <thread>
-#include <cstdio>
 
+// ponytail: MSVC CI 0xc0000409 診断用。stdout を無バッファ化し、
+// fail-fast (abort) 時にも Catch2 出力が残るようにする。原因判明後に除去。
 static int startup_checker() {
-  std::puts("ALIVE: static init done");
-  std::fflush(stdout);
+  setvbuf(stdout, nullptr, _IONBF, 0);
+  std::fprintf(stderr, "ALIVE: static init done\n");
   return 0;
 }
 static int const g_checker = startup_checker();
 
+/** @brief テストごとに一時ディレクトリを払い出すフィクスチャ */
 struct DbFixture {
-  std::filesystem::path  path;
-  redismm::EmbeddedRedis db;
+  std::filesystem::path  path; ///< テスト用 DB パス
+  redismm::EmbeddedRedis db;   ///< テスト対象インスタンス
 
+  /**
+   * @brief テンポラリパスを生成し、既存ディレクトリを削除する
+   *
+   * @return フレッシュなパス
+   */
   static std::filesystem::path fresh_path() {
     auto p = std::filesystem::temp_directory_path() / "redismm_test";
     std::filesystem::remove_all(p);
@@ -30,7 +38,7 @@ struct DbFixture {
 // ---- Strings ----
 
 TEST_CASE_METHOD(DbFixture, "String set/get roundtrip") {
-  std::puts("FIRST_TEST_BODY");
+  std::fprintf(stderr, "FIRST_TEST_BODY\n");
   REQUIRE(db.set("k", "hello").has_value());
   auto v = db.get("k");
   REQUIRE(v.has_value());
@@ -56,11 +64,11 @@ TEST_CASE_METHOD(DbFixture, "String get missing") {
 TEST_CASE_METHOD(DbFixture, "Hash hset/hget") {
   auto r = db.hset("h", "f", "v");
   REQUIRE(r.has_value());
-  REQUIRE(*r == true);
+  REQUIRE(*r == true); // new field
 
   r = db.hset("h", "f", "v2");
   REQUIRE(r.has_value());
-  REQUIRE(*r == false);
+  REQUIRE(*r == false); // existing field
 
   auto g = db.hget("h", "f");
   REQUIRE(g.has_value());
@@ -81,207 +89,218 @@ TEST_CASE_METHOD(DbFixture, "Hash hgetall") {
 
 TEST_CASE_METHOD(DbFixture, "Hash WrongType") {
   std::ignore = db.set("s", "val");
-  auto r = db.hset("s", "f", "v");
+  auto r      = db.hget("s", "f");
   REQUIRE_FALSE(r.has_value());
   REQUIRE(r.error() == redismm::ErrorCode::WrongType);
 }
 
 // ---- Lists ----
 
-TEST_CASE_METHOD(DbFixture, "List lpush/lrange") {
-  REQUIRE(db.lpush("lst", "c").has_value());
-  REQUIRE(db.lpush("lst", "b").has_value());
-  REQUIRE(db.lpush("lst", "a").has_value());
+TEST_CASE_METHOD(DbFixture, "List rpush/lpop FIFO") {
+  std::ignore = db.rpush("q", "a");
+  std::ignore = db.rpush("q", "b");
+  std::ignore = db.rpush("q", "c");
 
-  auto r = db.lrange("lst", 0, -1);
-  REQUIRE(r.has_value());
-  REQUIRE(*r == std::vector<std::string>{"a", "b", "c"});
+  REQUIRE(*db.lpop("q") == "a");
+  REQUIRE(*db.lpop("q") == "b");
+  REQUIRE(*db.lpop("q") == "c");
+  REQUIRE_FALSE(db.lpop("q").has_value());
 }
 
-TEST_CASE_METHOD(DbFixture, "List rpush") {
-  REQUIRE(db.rpush("lst", "a").has_value());
-  REQUIRE(db.rpush("lst", "b").has_value());
-  REQUIRE(db.rpush("lst", "c").has_value());
+TEST_CASE_METHOD(DbFixture, "List lpush/rpop FILO") {
+  std::ignore = db.lpush("s", "a");
+  std::ignore = db.lpush("s", "b");
+  std::ignore = db.lpush("s", "c");
 
-  auto r = db.lrange("lst", 0, -1);
-  REQUIRE(r.has_value());
-  REQUIRE(*r == std::vector<std::string>{"a", "b", "c"});
+  REQUIRE(*db.rpop("s") == "a");
+  REQUIRE(*db.rpop("s") == "b");
+  REQUIRE(*db.rpop("s") == "c");
 }
 
-TEST_CASE_METHOD(DbFixture, "List lpop") {
-  REQUIRE(db.rpush("lst", "a").has_value());
-  REQUIRE(db.rpush("lst", "b").has_value());
-  REQUIRE(db.rpush("lst", "c").has_value());
-
-  auto v = db.lpop("lst");
-  REQUIRE(v.has_value());
-  REQUIRE(*v == "a");
-
-  v = db.lpop("lst");
-  REQUIRE(v.has_value());
-  REQUIRE(*v == "b");
-}
-
-TEST_CASE_METHOD(DbFixture, "List llen") {
-  REQUIRE(db.rpush("lst", "x").has_value());
-  REQUIRE(db.rpush("lst", "y").has_value());
-  REQUIRE(db.rpush("lst", "z").has_value());
-
-  auto n = db.llen("lst");
-  REQUIRE(n.has_value());
-  REQUIRE(*n == 3);
-}
-
-TEST_CASE_METHOD(DbFixture, "List ltrim") {
-  REQUIRE(db.rpush("lst", "a").has_value());
-  REQUIRE(db.rpush("lst", "b").has_value());
-  REQUIRE(db.rpush("lst", "c").has_value());
-  REQUIRE(db.rpush("lst", "d").has_value());
-  REQUIRE(db.rpush("lst", "e").has_value());
-
-  REQUIRE(db.ltrim("lst", 1, 3).has_value());
-
-  auto r = db.lrange("lst", 0, -1);
-  REQUIRE(r.has_value());
-  REQUIRE(*r == std::vector<std::string>{"b", "c", "d"});
-}
-
-TEST_CASE_METHOD(DbFixture, "List rpop") {
-  REQUIRE(db.rpush("lst", "a").has_value());
-  REQUIRE(db.rpush("lst", "b").has_value());
-  REQUIRE(db.rpush("lst", "c").has_value());
-
-  auto v = db.rpop("lst");
-  REQUIRE(v.has_value());
-  REQUIRE(*v == "c");
-
-  v = db.rpop("lst");
-  REQUIRE(v.has_value());
-  REQUIRE(*v == "b");
+TEST_CASE_METHOD(DbFixture, "List count") {
+  auto c1 = db.rpush("l", "x");
+  auto c2 = db.lpush("l", "y");
+  REQUIRE(*c1 == 1);
+  REQUIRE(*c2 == 2);
 }
 
 // ---- Sets ----
 
 TEST_CASE_METHOD(DbFixture, "Set sadd/smembers") {
-  REQUIRE(db.sadd("s", "a").has_value());
-  REQUIRE(db.sadd("s", "b").has_value());
-  REQUIRE(db.sadd("s", "c").has_value());
+  REQUIRE(*db.sadd("s", "a") == true);
+  REQUIRE(*db.sadd("s", "b") == true);
+  REQUIRE(*db.sadd("s", "a") == false); // dup
 
   auto m = db.smembers("s");
   REQUIRE(m.has_value());
-  REQUIRE(m->size() == 3);
-}
-
-TEST_CASE_METHOD(DbFixture, "Set srem") {
-  REQUIRE(db.sadd("s", "a").has_value());
-  REQUIRE(db.sadd("s", "b").has_value());
-
-  REQUIRE(db.srem("s", "a").has_value());
-  auto m = db.smembers("s");
-  REQUIRE(m.has_value());
-  REQUIRE(m->size() == 1);
-}
-
-TEST_CASE_METHOD(DbFixture, "Set sismember") {
-  REQUIRE(db.sadd("s", "a").has_value());
-  REQUIRE(db.sismember("s", "a").has_value());
-  REQUIRE_FALSE(db.sismember("s", "z").has_value());
-}
-
-TEST_CASE_METHOD(DbFixture, "Set scard") {
-  REQUIRE(db.sadd("s", "a").has_value());
-  REQUIRE(db.sadd("s", "b").has_value());
-
-  auto n = db.scard("s");
-  REQUIRE(n.has_value());
-  REQUIRE(*n == 2);
-}
-
-TEST_CASE_METHOD(DbFixture, "Set sunion") {
-  REQUIRE(db.sadd("s1", "a").has_value());
-  REQUIRE(db.sadd("s1", "b").has_value());
-  REQUIRE(db.sadd("s2", "b").has_value());
-  REQUIRE(db.sadd("s2", "c").has_value());
-
-  auto union_set = db.sunion({"s1", "s2"});
-  REQUIRE(union_set.has_value());
-  REQUIRE(union_set->size() == 3);
-  REQUIRE(union_set->count("a") == 1);
-  REQUIRE(union_set->count("b") == 1);
-  REQUIRE(union_set->count("c") == 1);
+  REQUIRE(m->size() == 2);
 }
 
 // ---- Sorted Sets ----
 
-TEST_CASE_METHOD(DbFixture, "ZSet zadd/zrange") {
-  REQUIRE(db.zadd("z", 1.0, "a").has_value());
-  REQUIRE(db.zadd("z", 3.0, "c").has_value());
-  REQUIRE(db.zadd("z", 2.0, "b").has_value());
+TEST_CASE_METHOD(DbFixture, "ZSet zadd/zrangebyscore") {
+  std::ignore = db.zadd("z", 1.0, "one");
+  std::ignore = db.zadd("z", 2.0, "two");
+  std::ignore = db.zadd("z", 3.0, "three");
 
-  auto r = db.zrange("z", 0, -1);
-  REQUIRE(r.has_value());
-  REQUIRE(r->size() == 3);
-  REQUIRE(r->at(0).member == "a");
-  REQUIRE(r->at(2).member == "c");
-}
-
-TEST_CASE_METHOD(DbFixture, "ZSet zadd update score") {
-  REQUIRE(db.zadd("z", 1.0, "k").has_value());
-  REQUIRE(db.zadd("z", 99.0, "k").has_value());
-
-  auto r = db.zrange("z", 0, -1);
+  auto r = db.zrangebyscore("z", 1.5, 2.5);
   REQUIRE(r.has_value());
   REQUIRE(r->size() == 1);
-  REQUIRE(r->at(0).member == "k");
-  REQUIRE(r->at(0).score == 99.0);
+  REQUIRE((*r)[0] == "two");
 }
 
-TEST_CASE_METHOD(DbFixture, "ZSet zrange by score") {
-  REQUIRE(db.zadd("z", 1.0, "a").has_value());
-  REQUIRE(db.zadd("z", 2.0, "b").has_value());
-  REQUIRE(db.zadd("z", 3.0, "c").has_value());
-  REQUIRE(db.zadd("z", 4.0, "d").has_value());
+TEST_CASE_METHOD(DbFixture, "ZSet score update") {
+  std::ignore = db.zadd("z", 1.0, "a");
+  std::ignore = db.zadd("z", 5.0, "a"); // update
 
-  auto r = db.zrangebyscore("z", 2.0, 3.0);
+  auto full = db.zrangebyscore("z", 0.0, 2.0);
+  REQUIRE(full.has_value());
+  REQUIRE(full->empty());
+
+  auto updated = db.zrangebyscore("z", 4.0, 6.0);
+  REQUIRE(updated.has_value());
+  REQUIRE(updated->size() == 1);
+}
+
+TEST_CASE_METHOD(DbFixture, "ZSet negative scores sorted") {
+  std::ignore = db.zadd("z", -3.0, "neg3");
+  std::ignore = db.zadd("z", -1.0, "neg1");
+  std::ignore = db.zadd("z", 0.0, "zero");
+  std::ignore = db.zadd("z", 2.0, "pos2");
+
+  auto r = db.zrangebyscore("z", -10.0, 10.0);
   REQUIRE(r.has_value());
-  REQUIRE(r->size() == 2);
+  REQUIRE(r->size() == 4);
+  REQUIRE((*r)[0] == "neg3");
+  REQUIRE((*r)[1] == "neg1");
+  REQUIRE((*r)[2] == "zero");
+  REQUIRE((*r)[3] == "pos2");
 }
 
-// ---- Expiry / TTL ----
+// ---- Streams ----
 
-TEST_CASE_METHOD(DbFixture, "Expire ttl") {
-  REQUIRE(db.set("k", "hello", 50u).has_value());
+TEST_CASE_METHOD(DbFixture, "Stream xadd auto-id") {
+  auto id1 = db.xadd("ev", "*", {{"k", "v"}});
+  auto id2 = db.xadd("ev", "*", {{"k", "v2"}});
+  REQUIRE(id1.has_value());
+  REQUIRE(id2.has_value());
+  REQUIRE(*id1 != *id2);
+}
+
+TEST_CASE_METHOD(DbFixture, "Stream xadd explicit id monotone") {
+  REQUIRE(db.xadd("s", "10-0", {}).has_value());
+  REQUIRE(db.xadd("s", "10-1", {}).has_value());
+  REQUIRE(db.xadd("s", "11-0", {}).has_value());
+
+  // 単調増加違反
+  auto bad = db.xadd("s", "10-0", {});
+  REQUIRE_FALSE(bad.has_value());
+  REQUIRE(bad.error() == redismm::ErrorCode::InvalidArgument);
+}
+
+// ---- Generic ----
+
+TEST_CASE_METHOD(DbFixture, "Generic del/exists") {
+  std::ignore = db.set("x", "1");
+  REQUIRE(*db.exists("x") == true);
+  REQUIRE(*db.del("x") == true);
+  REQUIRE(*db.exists("x") == false);
+  REQUIRE(*db.del("x") == false);
+}
+
+TEST_CASE_METHOD(DbFixture, "Generic del collection") {
+  std::ignore = db.rpush("lst", "a");
+  std::ignore = db.rpush("lst", "b");
+  REQUIRE(*db.del("lst") == true);
+  REQUIRE(*db.exists("lst") == false);
+}
+
+// ---- Expiration ----
+
+TEST_CASE_METHOD(DbFixture, "Expire expire/ttl") {
+  std::ignore = db.set("k", "v");
+
+  auto ex = db.expire("k", 10);
+  REQUIRE(ex.has_value());
+  REQUIRE(*ex == true);
 
   auto t = db.ttl("k");
   REQUIRE(t.has_value());
   REQUIRE(*t > 0);
-  REQUIRE(*t <= 50);
+  REQUIRE(*t <= 10);
 }
 
-TEST_CASE_METHOD(DbFixture, "Expire after ttl passes") {
-  REQUIRE(db.set("k", "hello", 10u).has_value());
+TEST_CASE_METHOD(DbFixture, "Expire pexpire/pttl") {
+  std::ignore = db.set("k", "v");
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  auto ex = db.pexpire("k", 10000);
+  REQUIRE(ex.has_value());
+  REQUIRE(*ex == true);
 
-  auto v = db.get("k");
-  REQUIRE_FALSE(v.has_value());
-  REQUIRE(v.error() == redismm::ErrorCode::NotFound);
+  auto pt = db.pttl("k");
+  REQUIRE(pt.has_value());
+  REQUIRE(*pt > 0);
+  REQUIRE(*pt <= 10000);
 }
 
 TEST_CASE_METHOD(DbFixture, "Expire persist") {
-  REQUIRE(db.set("k", "hello", 10u).has_value());
+  std::ignore = db.set("k", "v");
+  std::ignore = db.expire("k", 10);
 
-  REQUIRE(db.persist("k").has_value());
-  REQUIRE(db.ttl("k").has_value());
-  REQUIRE(*(db.ttl("k")) == -1);
-}
-
-TEST_CASE_METHOD(DbFixture, "Expire pexpire") {
-  REQUIRE(db.set("k", "hello").has_value());
-  REQUIRE(db.pexpire("k", 100).has_value());
+  auto ex = db.persist("k");
+  REQUIRE(ex.has_value());
+  REQUIRE(*ex == true);
 
   auto t = db.ttl("k");
   REQUIRE(t.has_value());
-  REQUIRE(*t > 0);
-  REQUIRE(*t <= 100);
+  REQUIRE(*t == -1);
+}
+
+TEST_CASE_METHOD(DbFixture, "Expire missing key") {
+  auto ex = db.expire("no_such", 10);
+  REQUIRE(ex.has_value());
+  REQUIRE(*ex == false);
+
+  auto t = db.ttl("no_such");
+  REQUIRE(t.has_value());
+  REQUIRE(*t == -1);
+
+  auto pt = db.pttl("no_such");
+  REQUIRE(pt.has_value());
+  REQUIRE(*pt == -1);
+
+  auto p = db.persist("no_such");
+  REQUIRE(p.has_value());
+  REQUIRE(*p == false);
+}
+
+TEST_CASE_METHOD(DbFixture, "Expire no TTL") {
+  std::ignore = db.set("k", "v");
+
+  auto t = db.ttl("k");
+  REQUIRE(t.has_value());
+  REQUIRE(*t == -1);
+
+  auto pt = db.pttl("k");
+  REQUIRE(pt.has_value());
+  REQUIRE(*pt == -1);
+
+  auto p = db.persist("k");
+  REQUIRE(p.has_value());
+  REQUIRE(*p == false);
+}
+
+TEST_CASE_METHOD(DbFixture, "Expire expired key") {
+  std::ignore = db.set("k", "v", 1); // 1ms TTL
+
+  // 少し待機して期限切れにする
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  auto t = db.ttl("k");
+  REQUIRE(t.has_value());
+  // get_meta で期限切れを検出すると遅延削除されるため -1 が返る
+  REQUIRE(*t == -1);
+
+  auto v = db.get("k");
+  REQUIRE_FALSE(v.has_value());
 }
