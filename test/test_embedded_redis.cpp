@@ -31,11 +31,21 @@ struct DbFixture {
     return p;
   }
 
-  DbFixture() : path(fresh_path()), db(path.string()) {}
-  ~DbFixture() { std::filesystem::remove_all(path); }
+  DbFixture() : path(fresh_path()), db(path.string()) {
+    std::fprintf(stderr, "FIXTURE_OPEN_OK\n");
+  }
+  ~DbFixture() {
+    std::fprintf(stderr, "FIXTURE_DTOR\n");
+    std::filesystem::remove_all(path);
+  }
 };
 
 // ---- Strings ----
+
+TEST_CASE("trivial: no fixture") {
+  std::fprintf(stderr, "TRIVIAL_TEST_BODY\n");
+  REQUIRE(1 + 1 == 2);
+}
 
 TEST_CASE_METHOD(DbFixture, "String set/get roundtrip") {
   std::fprintf(stderr, "FIRST_TEST_BODY\n");
