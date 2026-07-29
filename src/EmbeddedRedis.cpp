@@ -3,11 +3,11 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <format>
 #include <iostream>
 #include <limits>
 #include <memory>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -3503,19 +3503,16 @@ auto EmbeddedRedis::randomkey() -> Result<std::string> {
   // Reservoir sampling: pick one random key
   std::string result;
   uint64_t count = 0;
-  std::mt19937_64 rng{std::random_device{}()};
 
   for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
     auto const k = it->key();
     if (!k.starts_with(pfx_slice)) break;
+    if (k.size() < 2) continue;
     count++;
     if (count == 1) {
       result.assign(k.data() + 1, k.size() - 1);
-    } else {
-      std::uniform_int_distribution<uint64_t> dist(0, count - 1);
-      if (dist(rng) == 0) {
-        result.assign(k.data() + 1, k.size() - 1);
-      }
+    } else if (rand() % count == 0) {
+      result.assign(k.data() + 1, k.size() - 1);
     }
   }
   if (count == 0) return std::unexpected(ErrorCode::NotFound);
@@ -3541,6 +3538,7 @@ auto EmbeddedRedis::keys(std::string_view pattern) -> Result<std::vector<std::st
   for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
     auto const k = it->key();
     if (!k.starts_with(pfx_slice)) break;
+    if (k.size() < 2) continue;
     auto const key_str = std::string_view(k.data() + 1, k.size() - 1);
     if (glob_match(pattern, key_str)) {
       result.emplace_back(key_str);

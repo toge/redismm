@@ -1,0 +1,2 @@
+/home/toge/src/redismm/build_san/CMakeFiles/edit_cache.dir
+/home/toge/src/redismm/build_san/CMakeFiles/rebuild_cache.dir
