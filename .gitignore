@@ -1,0 +1,64 @@
+build
+build_static
+save-commands.json
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# ctags
+.tags
+
+.ccls-cache
+.cache
+.vscode
+
+compile_commands.json
+
+*.fig
+*.eps
+*.svg
+
+build*.sh
+test.sh
+
+*.log
+*.csv
+
+images*
+vcpkg_installed
+
+# AI related
+doc/superpowers
+.serena
+.opencode
+.commandcode
