@@ -30,10 +30,12 @@ if (MSVC)
 endif()
 
 ## add LTO flag
-include(CheckIPOSupported)
-check_ipo_supported(RESULT ipo_supported OUTPUT error)
-if(ipo_supported)
-  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+if(NOT MSVC)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT ipo_supported OUTPUT error)
+  if(ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+  endif()
 endif()
 
 ## other flag
