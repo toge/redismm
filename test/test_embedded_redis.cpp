@@ -250,8 +250,7 @@ TEST_CASE_METHOD(DbFixture, "ZSet zrange by score") {
 // ---- Expiry / TTL ----
 
 TEST_CASE_METHOD(DbFixture, "Expire ttl") {
-  auto constexpr ms = std::chrono::milliseconds(50);
-  REQUIRE(db.set("k", "hello", ms).has_value());
+  REQUIRE(db.set("k", "hello", 50u).has_value());
 
   auto t = db.ttl("k");
   REQUIRE(t.has_value());
@@ -260,10 +259,9 @@ TEST_CASE_METHOD(DbFixture, "Expire ttl") {
 }
 
 TEST_CASE_METHOD(DbFixture, "Expire after ttl passes") {
-  auto constexpr ms = std::chrono::milliseconds(10);
-  REQUIRE(db.set("k", "hello", ms).has_value());
+  REQUIRE(db.set("k", "hello", 10u).has_value());
 
-  std::this_thread::sleep_for(ms * 3);
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
 
   auto v = db.get("k");
   REQUIRE_FALSE(v.has_value());
@@ -271,8 +269,7 @@ TEST_CASE_METHOD(DbFixture, "Expire after ttl passes") {
 }
 
 TEST_CASE_METHOD(DbFixture, "Expire persist") {
-  auto constexpr ms = std::chrono::milliseconds(10);
-  REQUIRE(db.set("k", "hello", ms).has_value());
+  REQUIRE(db.set("k", "hello", 10u).has_value());
 
   REQUIRE(db.persist("k").has_value());
   REQUIRE(db.ttl("k").has_value());
