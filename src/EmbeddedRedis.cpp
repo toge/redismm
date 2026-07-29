@@ -1631,6 +1631,7 @@ auto EmbeddedRedis::linsert(std::string_view key, InsertPosition pos, std::strin
   for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
     auto const k = it->key();
     if (!k.starts_with(pfx_slice)) break;
+    if (static_cast<std::size_t>(k.size()) < seq_offset + 8) break;
     auto const seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
     seqs.push_back(seq);
     vals.emplace_back(it->value().data(), it->value().size());
