@@ -250,6 +250,113 @@ void test_expire(redismm::EmbeddedRedis& db) {
   check("persist no TTL → false", ok(ex5) && *ex5 == false);
 }
 
+/**
+ * @brief リスト拡張操作のデモ
+ *
+ * @param db データベースインスタンス
+ */
+void test_list_ops(redismm::EmbeddedRedis& db) {
+  std::println("\n=== List Operations ===");
+
+  std::ignore = db.rpush("mylist", "a");
+  std::ignore = db.rpush("mylist", "b");
+  std::ignore = db.rpush("mylist", "c");
+  std::ignore = db.rpush("mylist", "d");
+  std::ignore = db.rpush("mylist", "e");
+
+  auto r1 = db.lrange("mylist", 0, -1);
+  check("lrange all size == 5", ok(r1) && r1->size() == 5);
+
+  auto r2 = db.lrange("mylist", 1, 3);
+  check("lrange [1,3] size == 3", ok(r2) && r2->size() == 3);
+  check("lrange [1,3] values", ok(r2) && (*r2)[0] == "b" && (*r2)[2] == "d");
+
+  auto r3 = db.lrange("mylist", -2, -1);
+  check("lrange [-2,-1] size == 2", ok(r3) && r3->size() == 2);
+  check("lrange [-2,-1] values", ok(r3) && (*r3)[0] == "d" && (*r3)[1] == "e");
+
+  auto rem = db.lrem("mylist", 1, "b");
+  check("lrem 1 'b' → 1", ok(rem) && *rem == 1);
+
+  auto r4 = db.lrange("mylist", 0, -1);
+  check("after lrem size == 4", ok(r4) && r4->size() == 4);
+  check("after lrem no 'b'", ok(r4) && (*r4)[0] == "a" && (*r4)[1] == "c");
+
+  auto tr = db.ltrim("mylist", 1, 2);
+  check("ltrim [1,2] → ok", ok(tr));
+
+  auto r5 = db.lrange("mylist", 0, -1);
+  check("after ltrim size == 2", ok(r5) && r5->size() == 2);
+  check("after ltrim values", ok(r5) && (*r5)[0] == "c" && (*r5)[1] == "d");
+}
+
+/**
+ * @brief セット拡張操作のデモ
+ *
+ * @param db データベースインスタンス
+ */
+void test_set_ops(redismm::EmbeddedRedis& db) {
+  std::println("\n=== Set Operations ===");
+
+  std::ignore = db.sadd("myset", "a");
+  std::ignore = db.sadd("myset", "b");
+  std::ignore = db.sadd("myset", "c");
+
+  auto r1 = db.srem("myset", "b");
+  check("srem 'b' → true", ok(r1) && *r1 == true);
+
+  auto r2 = db.srem("myset", "b");
+  check("srem 'b' again → false", ok(r2) && *r2 == false);
+
+  auto r3 = db.smembers("myset");
+  check("smembers size == 2", ok(r3) && r3->size() == 2);
+}
+
+/**
+ * @brief Pipeline のデモ
+ *
+ * @param db データベースインスタンス
+ */
+void test_pipeline(redismm::EmbeddedRedis& db) {
+  std::println("\n=== Pipeline ===");
+
+  auto pipe = db.pipeline();
+
+  pipe.set("pkey1", "value1")
+      .set("pkey2", "value2")
+      .hset("phash", "field1", "fvalue1")
+      .sadd("pset", "member1")
+      .rpush("plist", "item1")
+      .rpush("plist", "item2")
+      .zadd("pzset", 1.0, "zmember1");
+
+  auto r = pipe.exec();
+  check("pipeline exec → ok", ok(r));
+
+  auto v1 = db.get("pkey1");
+  check("pipeline get pkey1", ok(v1) && *v1 == "value1");
+
+  auto v2 = db.hget("phash", "field1");
+  check("pipeline hget phash", ok(v2) && *v2 == "fvalue1");
+
+  auto v3 = db.smembers("pset");
+  check("pipeline smembers pset", ok(v3) && v3->size() == 1);
+
+  auto v4 = db.lrange("plist", 0, -1);
+  check("pipeline lrange plist", ok(v4) && v4->size() == 2);
+
+  // 同じキーへの連続操作
+  auto pipe2 = db.pipeline();
+  pipe2.set("counter", "1")
+      .expire("counter", 10);
+
+  auto r2 = pipe2.exec();
+  check("pipeline same key exec → ok", ok(r2));
+
+  auto t = db.ttl("counter");
+  check("pipeline ttl > 0", ok(t) && *t > 0);
+}
+
 } // namespace
 
 /** @brief デモエントリポイント */
@@ -273,6 +380,9 @@ int main() {
   test_streams(db);
   test_generic(db);
   test_expire(db);
+  test_list_ops(db);
+  test_set_ops(db);
+  test_pipeline(db);
 
   std::println("\nDone.");
   return 0;
