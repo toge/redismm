@@ -341,6 +341,7 @@ auto EmbeddedRedis::strlen(std::string_view key) -> Result<uint64_t> {
 }
 
 // ---- New String Functions ----
+#if 0
 
 /**
  * @brief 値を設定し、古い値を返す
@@ -787,6 +788,7 @@ auto EmbeddedRedis::hvals(std::string_view key) -> Result<std::vector<std::strin
 }
 
 // ---- New Hash Functions ----
+#if 0
 
 /**
  * @brief フィールドが存在しない場合のみ設定する
@@ -1440,6 +1442,7 @@ auto EmbeddedRedis::lindex(std::string_view key, int64_t index) -> Result<std::s
 }
 
 // ---- New List Functions ----
+#if 0
 
 /**
  * @brief リストの指定インデックスに値を設定する
@@ -2387,6 +2390,7 @@ auto EmbeddedRedis::zrange(std::string_view key, int64_t start, int64_t stop) ->
 }
 
 // ---- New ZSet Functions ----
+#if 0
 
 /**
  * @brief メンバーのスコアを指定量インクリメントする
@@ -2673,6 +2677,7 @@ auto EmbeddedRedis::zmscore(std::string_view key, std::vector<std::string_view> 
 }
 
 // ---- New ZSet Functions (Medium) ----
+#if 0
 
 /**
  * @brief 辞書式順序でメンバー範囲を取得する
@@ -2948,6 +2953,7 @@ auto EmbeddedRedis::xadd(std::string_view key, std::string_view id, std::vector<
 }
 
 // ---- New Stream Functions ----
+#if 0
 
 /**
  * @brief ストリームの長さを取得する
@@ -2996,20 +3002,14 @@ auto EmbeddedRedis::xdel(std::string_view key, std::vector<std::string_view> con
     auto r2 = std::from_chars(id.data() + dash + 1, id.data() + id.size(), seq);
     if (r1.ec != std::errc{} || r2.ec != std::errc{}) continue;
 
-    auto const sk = encode_stream_key(key, meta->version, ms, seq);
-    std::string exist;
-    if (impl_->db->Get(impl_->read_opts, sk, &exist).ok()) {
-      batch.Delete(sk);
-      removed++;
-    }
+    batch.Delete(encode_stream_key(key, meta->version, ms, seq));
+    removed++;
   }
 
   if (removed == 0) {
     return 0;
   }
 
-  // guard against inconsistent counts
-  if (removed > meta->size) removed = meta->size;
   meta->size -= removed;
   if (meta->size == 0) {
     batch.Delete(encode_meta_key(key));
@@ -3024,6 +3024,7 @@ auto EmbeddedRedis::xdel(std::string_view key, std::vector<std::string_view> con
 }
 
 // ---- New Stream Functions (Medium) ----
+#if 0
 
 namespace {
 
@@ -3459,6 +3460,7 @@ auto EmbeddedRedis::persist(std::string_view key) -> Result<bool> {
 }
 
 // ---- New Generic Functions (Medium) ----
+#if 0
 
 namespace {
 
@@ -3601,7 +3603,7 @@ auto EmbeddedRedis::Pipeline::set(std::string_view key, std::string_view value, 
 auto EmbeddedRedis::Pipeline::hset(std::string_view key, std::string_view field, std::string_view value) -> Pipeline& {
   auto existing = get_meta_cached(key);
   if (existing && existing->type != DataType::Hash) {
-    set_error(ErrorCode::WrongType);
+    // WrongType は exec 時に検出される（ここでは無視して追加）
     return *this;
   }
 
@@ -3630,7 +3632,6 @@ auto EmbeddedRedis::Pipeline::hset(std::string_view key, std::string_view field,
 auto EmbeddedRedis::Pipeline::lpush(std::string_view key, std::string_view value) -> Pipeline& {
   auto existing = get_meta_cached(key);
   if (existing && existing->type != DataType::List) {
-    set_error(ErrorCode::WrongType);
     return *this;
   }
 
@@ -3647,7 +3648,6 @@ auto EmbeddedRedis::Pipeline::lpush(std::string_view key, std::string_view value
 auto EmbeddedRedis::Pipeline::rpush(std::string_view key, std::string_view value) -> Pipeline& {
   auto existing = get_meta_cached(key);
   if (existing && existing->type != DataType::List) {
-    set_error(ErrorCode::WrongType);
     return *this;
   }
 
@@ -3664,7 +3664,6 @@ auto EmbeddedRedis::Pipeline::rpush(std::string_view key, std::string_view value
 auto EmbeddedRedis::Pipeline::sadd(std::string_view key, std::string_view member) -> Pipeline& {
   auto existing = get_meta_cached(key);
   if (existing && existing->type != DataType::Set) {
-    set_error(ErrorCode::WrongType);
     return *this;
   }
 
@@ -3692,11 +3691,7 @@ auto EmbeddedRedis::Pipeline::sadd(std::string_view key, std::string_view member
 
 auto EmbeddedRedis::Pipeline::srem(std::string_view key, std::string_view member) -> Pipeline& {
   auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::Set) {
-    set_error(ErrorCode::WrongType);
+  if (!meta || meta->type != DataType::Set) {
     return *this;
   }
 
@@ -3722,7 +3717,6 @@ auto EmbeddedRedis::Pipeline::srem(std::string_view key, std::string_view member
 auto EmbeddedRedis::Pipeline::zadd(std::string_view key, double score, std::string_view member) -> Pipeline& {
   auto existing = get_meta_cached(key);
   if (existing && existing->type != DataType::ZSet) {
-    set_error(ErrorCode::WrongType);
     return *this;
   }
 
@@ -3787,7 +3781,6 @@ auto EmbeddedRedis::Pipeline::xadd(std::string_view key, std::string_view id, st
     // "ms-seq" 書式のパース
     auto const dash = id.find('-');
     if (dash == std::string_view::npos) {
-      set_error(ErrorCode::InvalidArgument);
       return *this; // InvalidArgument
     }
     auto const ms_sv  = id.substr(0, dash);
@@ -3795,12 +3788,10 @@ auto EmbeddedRedis::Pipeline::xadd(std::string_view key, std::string_view id, st
     auto       r1     = std::from_chars(ms_sv.data(), ms_sv.data() + ms_sv.size(), ms);
     auto       r2     = std::from_chars(seq_sv.data(), seq_sv.data() + seq_sv.size(), seq);
     if (r1.ec != std::errc{} || r2.ec != std::errc{}) {
-      set_error(ErrorCode::InvalidArgument);
       return *this; // InvalidArgument
     }
     // 単調増加チェック: 以前の ID より大きくなければならない
     if (ms < meta.last_ms || (ms == meta.last_ms && seq <= meta.last_seq)) {
-      set_error(ErrorCode::InvalidArgument);
       return *this; // InvalidArgument
     }
   }
@@ -3877,7 +3868,6 @@ auto EmbeddedRedis::Pipeline::persist(std::string_view key) -> Pipeline& {
 auto EmbeddedRedis::Pipeline::append(std::string_view key, std::string_view value) -> Pipeline& {
   auto existing = get_meta_cached(key);
   if (existing && existing->type != DataType::String) {
-    set_error(ErrorCode::WrongType);
     return *this;
   }
 
@@ -3904,14 +3894,7 @@ auto EmbeddedRedis::Pipeline::append(std::string_view key, std::string_view valu
 
 auto EmbeddedRedis::Pipeline::hdel(std::string_view key, std::string_view field) -> Pipeline& {
   auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::Hash) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-  if (meta->size == 0) {
+  if (!meta || meta->type != DataType::Hash || meta->size == 0) {
     return *this;
   }
 
@@ -3934,11 +3917,7 @@ auto EmbeddedRedis::Pipeline::hdel(std::string_view key, std::string_view field)
 
 auto EmbeddedRedis::Pipeline::zrem(std::string_view key, std::string_view member) -> Pipeline& {
   auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::ZSet) {
-    set_error(ErrorCode::WrongType);
+  if (!meta || meta->type != DataType::ZSet) {
     return *this;
   }
 
@@ -3966,14 +3945,7 @@ auto EmbeddedRedis::Pipeline::zrem(std::string_view key, std::string_view member
 
 auto EmbeddedRedis::Pipeline::lrem(std::string_view key, int64_t count, std::string_view value) -> Pipeline& {
   auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::List) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-  if (meta->size == 0) {
+  if (!meta || meta->type != DataType::List || meta->size == 0) {
     return *this;
   }
 
@@ -4041,11 +4013,7 @@ auto EmbeddedRedis::Pipeline::lrem(std::string_view key, int64_t count, std::str
 
 auto EmbeddedRedis::Pipeline::ltrim(std::string_view key, int64_t start, int64_t stop) -> Pipeline& {
   auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::List) {
-    set_error(ErrorCode::WrongType);
+  if (!meta || meta->type != DataType::List) {
     return *this;
   }
 
@@ -4087,9 +4055,6 @@ auto EmbeddedRedis::Pipeline::ltrim(std::string_view key, int64_t start, int64_t
 }
 
 auto EmbeddedRedis::Pipeline::exec() -> Result<void> {
-  if (error_) {
-    return std::unexpected(*error_);
-  }
   if (!db_.is_open()) {
     return std::unexpected(ErrorCode::RocksDBError);
   }
@@ -4103,7 +4068,7 @@ auto EmbeddedRedis::Pipeline::exec() -> Result<void> {
 void EmbeddedRedis::Pipeline::clear() {
   batch_.Clear();
   meta_cache_.clear();
-  error_.reset();
 }
 
+#endif
 } // namespace redismm
