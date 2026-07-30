@@ -194,6 +194,169 @@ TEST_CASE_METHOD(DbFixture, "Stream xadd explicit id monotone") {
   REQUIRE(bad.error() == redismm::ErrorCode::InvalidArgument);
 }
 
+TEST_CASE_METHOD(DbFixture, "Stream xdel deletes existing and skips missing") {
+  // prepare stream with two entries
+  auto id1r = db.xadd("st", "*", {{"k", "v1"}});
+  auto id2r = db.xadd("st", "*", {{"k", "v2"}});
+  REQUIRE(id1r.has_value());
+  REQUIRE(id2r.has_value());
+  std::string id1 = *id1r;
+  std::string id2 = *id2r;
+
+  // delete existing id1
+  auto r1 = db.xdel("st", std::vector<std::string_view>{std::string_view(id1)});
+  REQUIRE(r1.has_value());
+  REQUIRE(*r1 == 1);
+  auto len_after1 = db.xlen("st");
+  REQUIRE(len_after1.has_value());
+  REQUIRE(*len_after1 == 1);
+
+  // deleting a non-existent id should return 0 and not change size
+  auto r2 = db.xdel("st", std::vector<std::string_view>{"999999-0"});
+  REQUIRE(r2.has_value());
+  REQUIRE(*r2 == 0);
+  auto len_after2 = db.xlen("st");
+  REQUIRE(len_after2.has_value());
+  REQUIRE(*len_after2 == 1);
+
+  // delete existing mixed with missing
+  auto id3r = db.xadd("st", "*", {{"k", "v3"}});
+  REQUIRE(id3r.has_value());
+  std::string id3 = *id3r;
+  // current ids: id2, id3
+  auto r3 = db.xdel("st", std::vector<std::string_view>{std::string_view(id2), "nope-0"});
+  REQUIRE(r3.has_value());
+  REQUIRE(*r3 == 1);
+  auto len_after3 = db.xlen("st");
+  REQUIRE(len_after3.has_value());
+  REQUIRE(*len_after3 == 1);
+}
+
+TEST_CASE_METHOD(DbFixture, "Stream xdel id double-delete does not underflow") {
+  auto idr = db.xadd("sx", "*", {{"k", "v"}});
+  REQUIRE(idr.has_value());
+  std::string id = *idr;
+
+  // first delete succeeds
+  auto r1 = db.xdel("sx", std::vector<std::string_view>{std::string_view(id)});
+  REQUIRE(r1.has_value());
+  REQUIRE(*r1 == 1);
+  auto len1 = db.xlen("sx");
+  REQUIRE(len1.has_value());
+  REQUIRE(*len1 == 0);
+
+  // second delete of same id should be a no-op and not make size wrap
+  auto r2 = db.xdel("sx", std::vector<std::string_view>{std::string_view(id)});
+  REQUIRE(r2.has_value());
+  REQUIRE(*r2 == 0);
+  auto len2 = db.xlen("sx");
+  REQUIRE(len2.has_value());
+  REQUIRE(*len2 == 0);
+}
+
+// ---- Generic ----
+
+TEST_CASE_METHOD(DbFixture, "Pipeline records WrongType and prevents exec") {
+  // prepare a string key
+  std::ignore = db.set("pk", "val");
+
+  auto pipe = db.pipeline();
+  pipe.hset("pk", "f", "v");
+  auto res = pipe.exec();
+  REQUIRE_FALSE(res.has_value());
+  REQUIRE(res.error() == redismm::ErrorCode::WrongType);
+
+  // ensure original key remains a string and unchanged
+  auto gv = db.get("pk");
+  REQUIRE(gv.has_value());
+  REQUIRE(*gv == "val");
+}
+
+TEST_CASE_METHOD(DbFixture, "Pipeline records InvalidArgument for bad xadd id and prevents exec") {
+  auto pipe = db.pipeline();
+  pipe.xadd("ps", "bad-id", {});
+  auto res = pipe.exec();
+  REQUIRE_FALSE(res.has_value());
+  REQUIRE(res.error() == redismm::ErrorCode::InvalidArgument);
+
+  // no stream should be created
+  auto len = db.xlen("ps");
+  REQUIRE(len.has_value());
+  REQUIRE(*len == 0);
+}
+
+TEST_CASE_METHOD(DbFixture, "Pipeline keeps first error when earlier op fails") {
+  // prepare a string key
+  std::ignore = db.set("k", "v");
+
+  auto pipe = db.pipeline();
+  // first operation errors (WrongType)
+  pipe.hset("k", "f", "val");
+  // second operation would error with InvalidArgument if evaluated
+  pipe.xadd("s", "bad-id", {});
+
+  auto res = pipe.exec();
+  REQUIRE_FALSE(res.has_value());
+  REQUIRE(res.error() == redismm::ErrorCode::WrongType);
+
+  // ensure no changes were applied
+  auto gv = db.get("k");
+  REQUIRE(gv.has_value());
+  REQUIRE(*gv == "v");
+  auto sl = db.xlen("s");
+  REQUIRE(sl.has_value());
+  REQUIRE(*sl == 0);
+}
+
+TEST_CASE_METHOD(DbFixture, "Pipeline keeps first error when a later op errors before another") {
+  // prepare a string key for WrongType check later
+  std::ignore = db.set("k", "orig");
+
+  auto pipe = db.pipeline();
+  // first op succeeds (creates hash 'h')
+  pipe.hset("h", "f", "1");
+  // second op errors (InvalidArgument)
+  pipe.xadd("s2", "bad-id", {});
+  // third op would error (WrongType) but must not overwrite earlier error
+  pipe.hset("k", "f2", "2");
+
+  auto res = pipe.exec();
+  REQUIRE_FALSE(res.has_value());
+  REQUIRE(res.error() == redismm::ErrorCode::InvalidArgument);
+
+  // ensure no changes were applied: stream not created and hash not created
+  auto sl = db.xlen("s2");
+  REQUIRE(sl.has_value());
+  REQUIRE(*sl == 0);
+  auto hget = db.hget("h", "f");
+  REQUIRE_FALSE(hget.has_value());
+  REQUIRE(hget.error() == redismm::ErrorCode::NotFound);
+  auto gv = db.get("k");
+  REQUIRE(gv.has_value());
+  REQUIRE(*gv == "orig");
+}
+
+TEST_CASE_METHOD(DbFixture, "Pipeline exec clears pending ops on error so pipeline can be reused") {
+  // prepare a string key that will trigger WrongType
+  std::ignore = db.set("r", "v");
+
+  auto pipe = db.pipeline();
+  pipe.hset("r", "f", "x"); // will set WrongType in pipeline
+
+  auto res = pipe.exec();
+  REQUIRE_FALSE(res.has_value());
+  REQUIRE(res.error() == redismm::ErrorCode::WrongType);
+
+  // after failing exec, pipeline should be cleared and reusable
+  auto pipe2 = db.pipeline();
+  pipe2.set("ok", "1");
+  auto r2 = pipe2.exec();
+  REQUIRE(r2.has_value());
+  auto got = db.get("ok");
+  REQUIRE(got.has_value());
+  REQUIRE(*got == "1");
+}
+
 // ---- Generic ----
 
 TEST_CASE_METHOD(DbFixture, "Generic del/exists") {
