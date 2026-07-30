@@ -61,6 +61,34 @@ TEST_CASE_METHOD(DbFixture, "String getset when missing returns NotFound") {
   REQUIRE(res.error() == redismm::ErrorCode::NotFound);
 }
 
+TEST_CASE_METHOD(DbFixture, "String getrange basics and negative indices") {
+  std::ignore = db.set("gk", "hello");
+  auto r1 = db.getrange("gk", 0, 1);
+  REQUIRE(r1.has_value());
+  REQUIRE(*r1 == "he");
+
+  auto r2 = db.getrange("gk", 1, -1);
+  REQUIRE(r2.has_value());
+  REQUIRE(*r2 == "ello");
+
+  auto r3 = db.getrange("gk", -2, -1);
+  REQUIRE(r3.has_value());
+  REQUIRE(*r3 == "lo");
+
+  auto r4 = db.getrange("gk", 2, 1);
+  REQUIRE(r4.has_value());
+  REQUIRE(*r4 == "");
+
+  auto r5 = db.getrange("gk", 0, 100);
+  REQUIRE(r5.has_value());
+  REQUIRE(*r5 == "hello");
+
+  // missing key returns empty string
+  auto rm = db.getrange("no_such", 0, 10);
+  REQUIRE(rm.has_value());
+  REQUIRE(*rm == "");
+}
+
 // ---- Hashes ----
 
 TEST_CASE_METHOD(DbFixture, "Hash hset/hget") {
