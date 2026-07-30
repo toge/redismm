@@ -336,6 +336,27 @@ TEST_CASE_METHOD(DbFixture, "Pipeline keeps first error when a later op errors b
   REQUIRE(*gv == "orig");
 }
 
+TEST_CASE_METHOD(DbFixture, "Pipeline exec clears pending ops on error so pipeline can be reused") {
+  // prepare a string key that will trigger WrongType
+  std::ignore = db.set("r", "v");
+
+  auto pipe = db.pipeline();
+  pipe.hset("r", "f", "x"); // will set WrongType in pipeline
+
+  auto res = pipe.exec();
+  REQUIRE_FALSE(res.has_value());
+  REQUIRE(res.error() == redismm::ErrorCode::WrongType);
+
+  // after failing exec, pipeline should be cleared and reusable
+  auto pipe2 = db.pipeline();
+  pipe2.set("ok", "1");
+  auto r2 = pipe2.exec();
+  REQUIRE(r2.has_value());
+  auto got = db.get("ok");
+  REQUIRE(got.has_value());
+  REQUIRE(*got == "1");
+}
+
 // ---- Generic ----
 
 TEST_CASE_METHOD(DbFixture, "Generic del/exists") {

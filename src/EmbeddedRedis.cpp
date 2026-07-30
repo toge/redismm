@@ -4088,7 +4088,10 @@ auto EmbeddedRedis::Pipeline::ltrim(std::string_view key, int64_t start, int64_t
 
 auto EmbeddedRedis::Pipeline::exec() -> Result<void> {
   if (error_) {
-    return std::unexpected(*error_);
+    // Clear pending operations to avoid reuse re-attempting the same batch
+    auto const e = *error_;
+    clear();
+    return std::unexpected(e);
   }
   if (!db_.is_open()) {
     return std::unexpected(ErrorCode::RocksDBError);
