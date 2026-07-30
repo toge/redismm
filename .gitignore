@@ -62,3 +62,14 @@ doc/superpowers
 .serena
 .opencode
 .commandcode
+# Local build artifacts and temporary files
+build/
+build_asan/
+build_ubsan/
+*.bak
+*.ci_stub
+*.full
+*.msvc_test
+*.stub3
+*.stubbed
+src/stub_new_functions.js
