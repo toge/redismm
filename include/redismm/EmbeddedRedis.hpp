@@ -973,12 +973,16 @@ private:
   EmbeddedRedis& db_;
   rocksdb::WriteBatch batch_;
   std::unordered_map<std::string, MetaValue> meta_cache_;
+  std::optional<ErrorCode> error_;
 
   /** @brief キャッシュ付きメタデータ取得 */
   auto get_meta_cached(std::string_view key) -> std::optional<MetaValue>;
 
   /** @brief キャッシュを更新 */
   void update_meta_cache(std::string_view key, MetaValue const& meta);
+
+  /** @brief Pipeline 内エラーを記録（最初のエラーのみ保持） */
+  void set_error(ErrorCode e) { if (!error_) error_ = e; }
 };
 
 } // namespace redismm
