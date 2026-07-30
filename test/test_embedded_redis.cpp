@@ -55,6 +55,12 @@ TEST_CASE_METHOD(DbFixture, "String get missing") {
   REQUIRE(v.error() == redismm::ErrorCode::NotFound);
 }
 
+TEST_CASE_METHOD(DbFixture, "String getset when missing returns NotFound") {
+  auto res = db.getset("missing_k", "val");
+  REQUIRE_FALSE(res.has_value());
+  REQUIRE(res.error() == redismm::ErrorCode::NotFound);
+}
+
 // ---- Hashes ----
 
 TEST_CASE_METHOD(DbFixture, "Hash hset/hget") {

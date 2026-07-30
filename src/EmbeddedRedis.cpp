@@ -352,14 +352,15 @@ auto EmbeddedRedis::getset(std::string_view key, std::string_view value) -> Resu
     return std::unexpected(ErrorCode::RocksDBError);
   }
   auto existing = impl_->get_meta(key);
-  if (!existing) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (existing->type != DataType::String) {
+  if (existing && existing->type != DataType::String) {
     return std::unexpected(ErrorCode::WrongType);
   }
 
   std::string old;
+  if (!existing) {
+    return std::unexpected(ErrorCode::NotFound);
+  }
+
   impl_->db->Get(impl_->read_opts, encode_string_key(key), &old);
 
   rocksdb::WriteBatch batch;
@@ -1646,15 +1647,20 @@ auto EmbeddedRedis::linsert(std::string_view key, InsertPosition pos, std::strin
   vals.insert(vals.begin() + static_cast<ptrdiff_t>(insert_idx), std::string(value));
 
   rocksdb::WriteBatch batch;
-  // delete old elements
-  for (auto const s : seqs) {
-    batch.Delete(encode_list_key(key, meta->version, s));
-  }
-  // write new elements with fresh seqs
-  auto const base = meta->head_seq + meta->size + 1000; // avoid collision
+
+  // Bump version to avoid seq collisions and delete old elements by prefix
+  auto const old_version = meta->version;
+  meta->version = meta->version + 1;
+  auto const new_version = meta->version;
+
+  impl_->delete_by_prefix(batch, encode_list_prefix(key, old_version));
+
+  // write new elements under new_version starting at a midpoint to allow lpush/rpush
+  auto const base = std::numeric_limits<uint64_t>::max() / 2;
   for (std::size_t i = 0; i < vals.size(); ++i) {
-    batch.Put(encode_list_key(key, meta->version, base + i), vals[i]);
+    batch.Put(encode_list_key(key, new_version, base + i), vals[i]);
   }
+
   meta->head_seq = base;
   meta->tail_seq = base + vals.size();
   meta->size = vals.size();
