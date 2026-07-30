@@ -506,8 +506,12 @@ inline std::string encode_stream_prefix(std::string_view key, uint64_t version) 
  * @param user_key    ユーザーキー
  * @return サフィックス部分。範囲外の場合は空文字列
  */
+inline std::size_t suffix_offset(std::string_view user_key, std::size_t prefix_len = 1) {
+  return prefix_len + user_key.size() + 8;
+}
+
 inline std::string_view extract_suffix(std::string_view encoded_key, std::size_t prefix_len, std::string_view user_key) {
-  auto const offset = prefix_len + user_key.size() + 8;
+  auto const offset = suffix_offset(user_key, prefix_len);
   if (encoded_key.size() <= offset) {
     return {};
   }
