@@ -2,18 +2,8 @@
 #include "redismm/EmbeddedRedis.hpp"
 
 #include <chrono>
-#include <cstdio>
 #include <filesystem>
 #include <thread>
-
-// ponytail: MSVC CI 0xc0000409 診断用。stdout を無バッファ化し、
-// fail-fast (abort) 時にも Catch2 出力が残るようにする。原因判明後に除去。
-static int startup_checker() {
-  setvbuf(stdout, nullptr, _IONBF, 0);
-  std::fprintf(stderr, "ALIVE: static init done\n");
-  return 0;
-}
-static int const g_checker = startup_checker();
 
 /** @brief テストごとに一時ディレクトリを払い出すフィクスチャ */
 struct DbFixture {
@@ -31,24 +21,20 @@ struct DbFixture {
     return p;
   }
 
-  DbFixture() : path(fresh_path()), db(path.string()) {
-    std::fprintf(stderr, "FIXTURE_OPEN_OK\n");
-  }
-  ~DbFixture() {
-    std::fprintf(stderr, "FIXTURE_DTOR\n");
-    std::filesystem::remove_all(path);
-  }
+  // デストラクタで remove_all してはいけない。dtor 本体は db の破棄より先に走るため、
+  // Windows では RocksDB が開いたままのファイル削除に失敗し、filesystem_error が
+  // noexcept デストラクタを脱出して terminate する (MSVC CI の 0xC0000409)。
+  // 各テストのクリーン状態は次テストの fresh_path() が保証する。
+  DbFixture() : path(fresh_path()), db(path.string()) {}
 };
 
 // ---- Strings ----
 
 TEST_CASE("trivial: no fixture") {
-  std::fprintf(stderr, "TRIVIAL_TEST_BODY\n");
   REQUIRE(1 + 1 == 2);
 }
 
 TEST_CASE_METHOD(DbFixture, "String set/get roundtrip") {
-  std::fprintf(stderr, "FIRST_TEST_BODY\n");
   REQUIRE(db.set("k", "hello").has_value());
   auto v = db.get("k");
   REQUIRE(v.has_value());
