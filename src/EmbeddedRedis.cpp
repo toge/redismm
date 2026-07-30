@@ -1181,7 +1181,7 @@ auto EmbeddedRedis::lrange(std::string_view key, int64_t start, int64_t stop) ->
   iter_opts.fill_cache = false;
   std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
 
-  auto const seq_offset = 1 + key.size() + 8; // prefix(1) + key + version(8)
+  auto const seq_offset = suffix_offset(key); // prefix(1) + key + version(8)
 
   for (it->Seek(seek_key); it->Valid(); it->Next()) {
     auto const k = it->key();
@@ -1227,7 +1227,7 @@ auto EmbeddedRedis::lrem(std::string_view key, int64_t count, std::string_view v
 
   auto const pfx = encode_list_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
-  auto const seq_offset = 1 + key.size() + 8;
+  auto const seq_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
@@ -1415,7 +1415,7 @@ auto EmbeddedRedis::lindex(std::string_view key, int64_t index) -> Result<std::s
   auto const pfx = encode_list_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
   auto const seek_key = encode_list_key(key, meta->version, meta->head_seq);
-  auto const seq_offset = 1 + key.size() + 8;
+  auto const seq_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
@@ -1470,7 +1470,7 @@ auto EmbeddedRedis::lset(std::string_view key, int64_t index, std::string_view v
   auto const pfx = encode_list_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
   auto const seek_key = encode_list_key(key, meta->version, meta->head_seq);
-  auto const seq_offset = 1 + key.size() + 8;
+  auto const seq_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
@@ -1519,7 +1519,7 @@ auto EmbeddedRedis::lpos(std::string_view key, std::string_view element) -> Resu
   auto const pfx = encode_list_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
   auto const seek_key = encode_list_key(key, meta->version, meta->head_seq);
-  auto const seq_offset = 1 + key.size() + 8;
+  auto const seq_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
@@ -1618,7 +1618,7 @@ auto EmbeddedRedis::linsert(std::string_view key, InsertPosition pos, std::strin
 
   auto const pfx = encode_list_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
-  auto const seq_offset = 1 + key.size() + 8;
+  auto const seq_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
@@ -2125,7 +2125,7 @@ auto EmbeddedRedis::zrangebyscore(std::string_view key, double min_score, double
   std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
 
   std::vector<std::string> result;
-  auto const               score_offset = 1 + key.size() + 8; // prefix(1) + key + version(8)
+  auto const               score_offset = suffix_offset(key); // prefix(1) + key + version(8)
 
   for (it->Seek(seek_key); it->Valid(); it->Next()) {
     auto const k = it->key();
@@ -2233,7 +2233,7 @@ auto EmbeddedRedis::zcount(std::string_view key, double min_score, double max_sc
   std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
 
   uint64_t count = 0;
-  auto const score_offset = 1 + key.size() + 8;
+  auto const score_offset = suffix_offset(key);
 
   for (it->Seek(seek_key); it->Valid(); it->Next()) {
     auto const k = it->key();
@@ -2303,7 +2303,7 @@ auto EmbeddedRedis::zrank(std::string_view key, std::string_view member) -> Resu
   iter_opts.fill_cache = false;
   std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
 
-  auto const score_offset = 1 + key.size() + 8;
+  auto const score_offset = suffix_offset(key);
   int64_t rank = 0;
 
   for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
@@ -2364,7 +2364,7 @@ auto EmbeddedRedis::zrange(std::string_view key, int64_t start, int64_t stop) ->
   std::vector<std::string> result;
   result.reserve(static_cast<std::size_t>(stop - start + 1));
 
-  auto const score_offset = 1 + key.size() + 8;
+  auto const score_offset = suffix_offset(key);
   int64_t pos = 0;
 
   for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
@@ -2463,7 +2463,7 @@ auto EmbeddedRedis::zrevrank(std::string_view key, std::string_view member) -> R
   iter_opts.fill_cache = false;
   std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
 
-  auto const score_offset = 1 + key.size() + 8;
+  auto const score_offset = suffix_offset(key);
   int64_t total = 0;
   int64_t target_rank = -1;
 
@@ -2556,7 +2556,7 @@ auto EmbeddedRedis::zpopmin(std::string_view key) -> Result<std::string> {
   }
 
   auto const k = it->key();
-  auto const score_offset = 1 + key.size() + 8;
+  auto const score_offset = suffix_offset(key);
   auto const member = std::string(k.data() + score_offset + 8, k.size() - score_offset - 8);
 
   // Get score from member key
@@ -2621,7 +2621,7 @@ auto EmbeddedRedis::zpopmax(std::string_view key) -> Result<std::string> {
   }
 
   auto const k = it->key();
-  auto const score_offset = 1 + key.size() + 8;
+  auto const score_offset = suffix_offset(key);
   auto const member = std::string(k.data() + score_offset + 8, k.size() - score_offset - 8);
 
   auto const mk = encode_zset_member_key(key, meta->version, member);
@@ -2687,7 +2687,7 @@ auto EmbeddedRedis::zrangebylex(std::string_view key, std::string_view min, std:
 
   auto const pfx = encode_zset_member_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
-  auto const member_offset = 1 + key.size() + 8;
+  auto const member_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
@@ -2721,7 +2721,7 @@ auto EmbeddedRedis::zlexcount(std::string_view key, std::string_view min, std::s
 
   auto const pfx = encode_zset_member_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
-  auto const member_offset = 1 + key.size() + 8;
+  auto const member_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
@@ -2763,7 +2763,7 @@ auto EmbeddedRedis::zremrangebyrank(std::string_view key, int64_t start, int64_t
 
   auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(range_pfx);
-  auto const score_offset = 1 + key.size() + 8;
+  auto const score_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
@@ -2821,7 +2821,7 @@ auto EmbeddedRedis::zremrangebyscore(std::string_view key, double min, double ma
   auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
   auto const seek_key  = encode_zset_score_seek_key(key, meta->version, min);
   rocksdb::Slice const pfx_slice(range_pfx);
-  auto const score_offset = 1 + key.size() + 8;
+  auto const score_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
@@ -3065,7 +3065,7 @@ auto EmbeddedRedis::xrange(std::string_view key, std::string_view start, std::st
 
   auto const pfx = encode_stream_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
-  auto const ms_offset = 1 + key.size() + 8;
+  auto const ms_offset = suffix_offset(key);
   auto const seq_offset = ms_offset + 8;
 
   rocksdb::ReadOptions iter_opts;
@@ -3136,7 +3136,7 @@ auto EmbeddedRedis::xrevrange(std::string_view key, std::string_view start, std:
 
   auto const pfx = encode_stream_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
-  auto const ms_offset = 1 + key.size() + 8;
+  auto const ms_offset = suffix_offset(key);
   auto const seq_offset = ms_offset + 8;
 
   rocksdb::ReadOptions iter_opts;
@@ -3983,7 +3983,7 @@ auto EmbeddedRedis::Pipeline::lrem(std::string_view key, int64_t count, std::str
 
   auto const pfx = encode_list_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
-  auto const seq_offset = 1 + key.size() + 8;
+  auto const seq_offset = suffix_offset(key);
 
   rocksdb::ReadOptions iter_opts;
   iter_opts.fill_cache = false;
