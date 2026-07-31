@@ -17,6 +17,16 @@
 
 namespace redismm {
 
+namespace {
+
+template <typename T>
+bool parse_number_strict(std::string_view raw, T& value) {
+  auto const [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), value);
+  return ec == std::errc{} && ptr == raw.data() + raw.size();
+}
+
+} // namespace
+
 /** @brief Pimpl 実装：RocksDB のラッパーと内部操作 */
 struct EmbeddedRedis::Impl {
   rocksdb::DB*          db         = nullptr; ///< RocksDB インスタンス
@@ -311,8 +321,7 @@ auto EmbeddedRedis::incrby(std::string_view key, int64_t delta) -> Result<int64_
   if (existing) {
     std::string raw;
     if (impl_->db->Get(impl_->read_opts, encode_string_key(key), &raw).ok()) {
-      auto [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), val);
-      if (ec != std::errc{}) {
+      if (!parse_number_strict(raw, val)) {
         return std::unexpected(ErrorCode::WrongType);
       }
     }
@@ -449,8 +458,7 @@ auto EmbeddedRedis::incrbyfloat(std::string_view key, double delta) -> Result<do
   if (existing) {
     std::string raw;
     if (impl_->db->Get(impl_->read_opts, encode_string_key(key), &raw).ok()) {
-      auto [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), val);
-      if (ec != std::errc{}) {
+      if (!parse_number_strict(raw, val)) {
         return std::unexpected(ErrorCode::WrongType);
       }
     }
@@ -882,8 +890,7 @@ auto EmbeddedRedis::hincrby(std::string_view key, std::string_view field, int64_
   int64_t val = 0;
   bool const found = impl_->db->Get(impl_->read_opts, hk, &raw).ok();
   if (found) {
-    auto [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), val);
-    if (ec != std::errc{}) {
+    if (!parse_number_strict(raw, val)) {
       return std::unexpected(ErrorCode::WrongType);
     }
   } else {
@@ -1717,6 +1724,56 @@ auto EmbeddedRedis::lmove(std::string_view source, std::string_view destination,
   if (!src_meta) return std::unexpected(ErrorCode::NotFound);
   if (src_meta->type != DataType::List) return std::unexpected(ErrorCode::WrongType);
   if (src_meta->size == 0) return std::unexpected(ErrorCode::NotFound);
+
+  if (source == destination) {
+    auto const pfx = encode_list_prefix(source, src_meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+    rocksdb::ReadOptions iter_opts;
+    iter_opts.fill_cache = false;
+    std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+
+    std::vector<std::string> values;
+    values.reserve(src_meta->size);
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) {
+        break;
+      }
+      values.emplace_back(it->value().data(), it->value().size());
+    }
+    if (values.empty()) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+
+    auto const moved = from == ListSide::Left ? values.front() : values.back();
+    if (values.size() == 1 || from == to) {
+      return moved;
+    }
+
+    if (from == ListSide::Left) {
+      std::rotate(values.begin(), values.begin() + 1, values.end());
+    } else {
+      std::rotate(values.rbegin(), values.rbegin() + 1, values.rend());
+    }
+
+    rocksdb::WriteBatch batch;
+    auto const old_version = src_meta->version;
+    src_meta->version = old_version + 1;
+    impl_->delete_by_prefix(batch, encode_list_prefix(source, old_version));
+
+    auto const base = std::numeric_limits<uint64_t>::max() / 2;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      batch.Put(encode_list_key(source, src_meta->version, base + i), values[i]);
+    }
+    src_meta->head_seq = base;
+    src_meta->tail_seq = base + values.size();
+    impl_->put_meta(batch, source, *src_meta);
+
+    if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
+      return std::unexpected(ErrorCode::RocksDBError);
+    }
+    return moved;
+  }
 
   auto dst_meta = impl_->get_meta(destination);
   if (dst_meta && dst_meta->type != DataType::List) return std::unexpected(ErrorCode::WrongType);
@@ -3601,19 +3658,117 @@ auto EmbeddedRedis::pipeline() -> Pipeline {
 }
 
 auto EmbeddedRedis::Pipeline::get_meta_cached(std::string_view key) -> std::optional<MetaValue> {
-  auto it = meta_cache_.find(std::string(key));
+  auto const key_str = std::string(key);
+  if (deleted_meta_cache_.contains(key_str)) {
+    return std::nullopt;
+  }
+  auto it = meta_cache_.find(key_str);
   if (it != meta_cache_.end()) {
     return it->second;
   }
   auto meta = db_.impl_->get_meta(key);
   if (meta) {
-    meta_cache_[std::string(key)] = *meta;
+    meta_cache_[key_str] = *meta;
   }
   return meta;
 }
 
 void EmbeddedRedis::Pipeline::update_meta_cache(std::string_view key, MetaValue const& meta) {
-  meta_cache_[std::string(key)] = meta;
+  auto const key_str = std::string(key);
+  deleted_meta_cache_.erase(key_str);
+  meta_cache_[key_str] = meta;
+}
+
+void EmbeddedRedis::Pipeline::clear_state_cache(std::string_view key) {
+  auto const key_str = std::string(key);
+  string_state_cache_.erase(key_str);
+  hash_field_state_cache_.erase(key_str);
+  set_member_state_cache_.erase(key_str);
+  zset_member_state_cache_.erase(key_str);
+}
+
+auto EmbeddedRedis::Pipeline::get_string_value_cached(std::string_view key) -> std::optional<std::string> {
+  auto const key_str = std::string(key);
+  if (auto const it = string_state_cache_.find(key_str); it != string_state_cache_.end()) {
+    return it->second;
+  }
+
+  auto const meta = get_meta_cached(key);
+  if (!meta || meta->type != DataType::String) {
+    string_state_cache_[key_str] = std::nullopt;
+    return std::nullopt;
+  }
+
+  std::string value;
+  if (!db_.impl_->db->Get(db_.impl_->read_opts, encode_string_key(key), &value).ok()) {
+    string_state_cache_[key_str] = std::nullopt;
+    return std::nullopt;
+  }
+
+  string_state_cache_[key_str] = value;
+  return value;
+}
+
+auto EmbeddedRedis::Pipeline::get_hash_field_exists_cached(std::string_view key, uint64_t version, std::string_view field) -> bool {
+  auto const key_str = std::string(key);
+  auto const field_str = std::string(field);
+  if (auto key_it = hash_field_state_cache_.find(key_str); key_it != hash_field_state_cache_.end()) {
+    if (auto field_it = key_it->second.find(field_str); field_it != key_it->second.end()) {
+      return field_it->second;
+    }
+  }
+  if (reset_state_cache_.contains(key_str)) {
+    hash_field_state_cache_[key_str][field_str] = false;
+    return false;
+  }
+
+  std::string dummy;
+  auto const exists = db_.impl_->db->Get(db_.impl_->read_opts, encode_hash_key(key, version, field), &dummy).ok();
+  hash_field_state_cache_[key_str][field_str] = exists;
+  return exists;
+}
+
+auto EmbeddedRedis::Pipeline::get_set_member_exists_cached(std::string_view key, uint64_t version, std::string_view member) -> bool {
+  auto const key_str = std::string(key);
+  auto const member_str = std::string(member);
+  if (auto key_it = set_member_state_cache_.find(key_str); key_it != set_member_state_cache_.end()) {
+    if (auto member_it = key_it->second.find(member_str); member_it != key_it->second.end()) {
+      return member_it->second;
+    }
+  }
+  if (reset_state_cache_.contains(key_str)) {
+    set_member_state_cache_[key_str][member_str] = false;
+    return false;
+  }
+
+  std::string dummy;
+  auto const exists = db_.impl_->db->Get(db_.impl_->read_opts, encode_set_key(key, version, member), &dummy).ok();
+  set_member_state_cache_[key_str][member_str] = exists;
+  return exists;
+}
+
+auto EmbeddedRedis::Pipeline::get_zset_member_score_cached(std::string_view key, uint64_t version, std::string_view member) -> std::optional<double> {
+  auto const key_str = std::string(key);
+  auto const member_str = std::string(member);
+  if (auto key_it = zset_member_state_cache_.find(key_str); key_it != zset_member_state_cache_.end()) {
+    if (auto member_it = key_it->second.find(member_str); member_it != key_it->second.end()) {
+      return member_it->second;
+    }
+  }
+  if (reset_state_cache_.contains(key_str)) {
+    zset_member_state_cache_[key_str][member_str] = std::nullopt;
+    return std::nullopt;
+  }
+
+  std::string score_raw;
+  if (!db_.impl_->db->Get(db_.impl_->read_opts, encode_zset_member_key(key, version, member), &score_raw).ok() || score_raw.size() != 8) {
+    zset_member_state_cache_[key_str][member_str] = std::nullopt;
+    return std::nullopt;
+  }
+
+  auto const score = decode_score(reinterpret_cast<uint8_t const*>(score_raw.data()));
+  zset_member_state_cache_[key_str][member_str] = score;
+  return score;
 }
 
 auto EmbeddedRedis::Pipeline::set(std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms) -> Pipeline& {
@@ -3622,6 +3777,8 @@ auto EmbeddedRedis::Pipeline::set(std::string_view key, std::string_view value, 
   // 既存キーが別の型なら先に全削除する
   if (existing && existing->type != DataType::String) {
     db_.impl_->erase_key_data(batch_, key, *existing);
+    clear_state_cache(key);
+    reset_state_cache_.insert(std::string(key));
     existing = std::nullopt;
   }
 
@@ -3633,6 +3790,7 @@ auto EmbeddedRedis::Pipeline::set(std::string_view key, std::string_view value, 
 
   db_.impl_->put_meta(batch_, key, meta);
   batch_.Put(encode_string_key(key), rocksdb::Slice(value.data(), value.size()));
+  string_state_cache_[std::string(key)] = std::string(value);
   update_meta_cache(key, meta);
   return *this;
 }
@@ -3653,14 +3811,12 @@ auto EmbeddedRedis::Pipeline::hset(std::string_view key, std::string_view field,
 
   auto const hk = encode_hash_key(key, meta.version, field);
 
-  // フィールドが既存かどうかを事前確認し、新規ならサイズを増やす
-  std::string dummy;
-  bool const  is_new = !db_.impl_->db->Get(db_.impl_->read_opts, hk, &dummy).ok();
-  if (is_new) {
+  if (!get_hash_field_exists_cached(key, meta.version, field)) {
     meta.size++;
   }
 
   batch_.Put(hk, rocksdb::Slice(value.data(), value.size()));
+  hash_field_state_cache_[std::string(key)][std::string(field)] = true;
   db_.impl_->put_meta(batch_, key, meta);
   update_meta_cache(key, meta);
   return *this;
@@ -3716,14 +3872,12 @@ auto EmbeddedRedis::Pipeline::sadd(std::string_view key, std::string_view member
 
   auto const sk = encode_set_key(key, meta.version, member);
 
-  // メンバーの重複チェック
-  std::string dummy;
-  bool const  is_new = !db_.impl_->db->Get(db_.impl_->read_opts, sk, &dummy).ok();
-  if (is_new) {
+  if (!get_set_member_exists_cached(key, meta.version, member)) {
     meta.size++;
   }
 
   batch_.Put(sk, rocksdb::Slice());
+  set_member_state_cache_[std::string(key)][std::string(member)] = true;
   db_.impl_->put_meta(batch_, key, meta);
   update_meta_cache(key, meta);
   return *this;
@@ -3741,20 +3895,24 @@ auto EmbeddedRedis::Pipeline::srem(std::string_view key, std::string_view member
 
   auto const sk = encode_set_key(key, meta->version, member);
 
-  // メンバーの存在確認
-  std::string dummy;
-  if (!db_.impl_->db->Get(db_.impl_->read_opts, sk, &dummy).ok()) {
+  if (!get_set_member_exists_cached(key, meta->version, member)) {
     return *this;
   }
 
   batch_.Delete(sk);
+  set_member_state_cache_[std::string(key)][std::string(member)] = false;
   meta->size--;
   if (meta->size == 0) {
     batch_.Delete(encode_meta_key(key));
+    auto const key_str = std::string(key);
+    meta_cache_.erase(key_str);
+    deleted_meta_cache_.insert(key_str);
+    clear_state_cache(key);
+    reset_state_cache_.insert(key_str);
   } else {
     db_.impl_->put_meta(batch_, key, *meta);
+    update_meta_cache(key, *meta);
   }
-  update_meta_cache(key, *meta);
   return *this;
 }
 
@@ -3774,15 +3932,9 @@ auto EmbeddedRedis::Pipeline::zadd(std::string_view key, double score, std::stri
 
   auto const mk = encode_zset_member_key(key, meta.version, member);
 
-  // 既存スコアがあれば、新しいスコアキーと衝突しないよう古いスコアキーを削除する
-  std::string old_score_raw;
-  bool const  is_new = !db_.impl_->db->Get(db_.impl_->read_opts, mk, &old_score_raw).ok();
-
-  if (!is_new && old_score_raw.size() == 8) {
-    auto const old_score = decode_score(reinterpret_cast<uint8_t const*>(old_score_raw.data()));
-    batch_.Delete(encode_zset_score_key(key, meta.version, old_score, member));
-  }
-  if (is_new) {
+  if (auto const old_score = get_zset_member_score_cached(key, meta.version, member)) {
+    batch_.Delete(encode_zset_score_key(key, meta.version, *old_score, member));
+  } else {
     meta.size++;
   }
 
@@ -3792,6 +3944,7 @@ auto EmbeddedRedis::Pipeline::zadd(std::string_view key, double score, std::stri
 
   // score key → empty
   batch_.Put(encode_zset_score_key(key, meta.version, score, member), rocksdb::Slice());
+  zset_member_state_cache_[std::string(key)][std::string(member)] = score;
   db_.impl_->put_meta(batch_, key, meta);
   update_meta_cache(key, meta);
   return *this;
@@ -3800,6 +3953,7 @@ auto EmbeddedRedis::Pipeline::zadd(std::string_view key, double score, std::stri
 auto EmbeddedRedis::Pipeline::xadd(std::string_view key, std::string_view id, std::vector<std::pair<std::string, std::string>> const& fields) -> Pipeline& {
   auto existing = get_meta_cached(key);
   if (existing && existing->type != DataType::Stream) {
+    set_error(ErrorCode::WrongType);
     return *this;
   }
 
@@ -3877,7 +4031,11 @@ auto EmbeddedRedis::Pipeline::del(std::string_view key) -> Pipeline& {
     return *this;
   }
   db_.impl_->erase_key_data(batch_, key, *meta);
-  meta_cache_.erase(std::string(key));
+  auto const key_str = std::string(key);
+  meta_cache_.erase(key_str);
+  deleted_meta_cache_.insert(key_str);
+  clear_state_cache(key);
+  reset_state_cache_.insert(key_str);
   return *this;
 }
 
@@ -3921,11 +4079,8 @@ auto EmbeddedRedis::Pipeline::append(std::string_view key, std::string_view valu
   }
 
   std::string current;
-  if (existing) {
-    std::string raw;
-    if (db_.impl_->db->Get(db_.impl_->read_opts, encode_string_key(key), &raw).ok()) {
-      current = std::move(raw);
-    }
+  if (auto cached = get_string_value_cached(key)) {
+    current = std::move(*cached);
   }
 
   current += value;
@@ -3937,6 +4092,7 @@ auto EmbeddedRedis::Pipeline::append(std::string_view key, std::string_view valu
 
   db_.impl_->put_meta(batch_, key, meta);
   batch_.Put(encode_string_key(key), rocksdb::Slice(current));
+  string_state_cache_[std::string(key)] = current;
   update_meta_cache(key, meta);
   return *this;
 }
@@ -3955,19 +4111,24 @@ auto EmbeddedRedis::Pipeline::hdel(std::string_view key, std::string_view field)
   }
 
   auto const hk = encode_hash_key(key, meta->version, field);
-  std::string dummy;
-  if (!db_.impl_->db->Get(db_.impl_->read_opts, hk, &dummy).ok()) {
+  if (!get_hash_field_exists_cached(key, meta->version, field)) {
     return *this;
   }
 
   batch_.Delete(hk);
+  hash_field_state_cache_[std::string(key)][std::string(field)] = false;
   meta->size--;
   if (meta->size == 0) {
     batch_.Delete(encode_meta_key(key));
+    auto const key_str = std::string(key);
+    meta_cache_.erase(key_str);
+    deleted_meta_cache_.insert(key_str);
+    clear_state_cache(key);
+    reset_state_cache_.insert(key_str);
   } else {
     db_.impl_->put_meta(batch_, key, *meta);
+    update_meta_cache(key, *meta);
   }
-  update_meta_cache(key, *meta);
   return *this;
 }
 
@@ -3980,26 +4141,27 @@ auto EmbeddedRedis::Pipeline::zrem(std::string_view key, std::string_view member
     set_error(ErrorCode::WrongType);
     return *this;
   }
+  auto const old_score = get_zset_member_score_cached(key, meta->version, member);
+  if (!old_score) {
+    return *this;
+  }
 
   auto const mk = encode_zset_member_key(key, meta->version, member);
-  std::string score_raw;
-  if (!db_.impl_->db->Get(db_.impl_->read_opts, mk, &score_raw).ok()) {
-    return *this;
-  }
-  if (score_raw.size() != 8) {
-    return *this;
-  }
-
-  auto const old_score = decode_score(reinterpret_cast<uint8_t const*>(score_raw.data()));
   batch_.Delete(mk);
-  batch_.Delete(encode_zset_score_key(key, meta->version, old_score, member));
+  batch_.Delete(encode_zset_score_key(key, meta->version, *old_score, member));
+  zset_member_state_cache_[std::string(key)][std::string(member)] = std::nullopt;
   meta->size--;
   if (meta->size == 0) {
     batch_.Delete(encode_meta_key(key));
+    auto const key_str = std::string(key);
+    meta_cache_.erase(key_str);
+    deleted_meta_cache_.insert(key_str);
+    clear_state_cache(key);
+    reset_state_cache_.insert(key_str);
   } else {
     db_.impl_->put_meta(batch_, key, *meta);
+    update_meta_cache(key, *meta);
   }
-  update_meta_cache(key, *meta);
   return *this;
 }
 
@@ -4071,10 +4233,15 @@ auto EmbeddedRedis::Pipeline::lrem(std::string_view key, int64_t count, std::str
   meta->size -= removed;
   if (meta->size == 0) {
     batch_.Delete(encode_meta_key(key));
+    auto const key_str = std::string(key);
+    meta_cache_.erase(key_str);
+    deleted_meta_cache_.insert(key_str);
+    clear_state_cache(key);
+    reset_state_cache_.insert(key_str);
   } else {
     db_.impl_->put_meta(batch_, key, *meta);
+    update_meta_cache(key, *meta);
   }
-  update_meta_cache(key, *meta);
   return *this;
 }
 
@@ -4101,7 +4268,11 @@ auto EmbeddedRedis::Pipeline::ltrim(std::string_view key, int64_t start, int64_t
   if (start > stop || size == 0) {
     // 全削除
     db_.impl_->erase_key_data(batch_, key, *meta);
-    meta_cache_.erase(std::string(key));
+    auto const key_str = std::string(key);
+    meta_cache_.erase(key_str);
+    deleted_meta_cache_.insert(key_str);
+    clear_state_cache(key);
+    reset_state_cache_.insert(key_str);
   } else {
     auto const head = static_cast<int64_t>(meta->head_seq);
     auto const new_head = static_cast<uint64_t>(head + start);
@@ -4145,6 +4316,12 @@ auto EmbeddedRedis::Pipeline::exec() -> Result<void> {
 void EmbeddedRedis::Pipeline::clear() {
   batch_.Clear();
   meta_cache_.clear();
+  deleted_meta_cache_.clear();
+  reset_state_cache_.clear();
+  string_state_cache_.clear();
+  hash_field_state_cache_.clear();
+  set_member_state_cache_.clear();
+  zset_member_state_cache_.clear();
   error_.reset();
 }
 

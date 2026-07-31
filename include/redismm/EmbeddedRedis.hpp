@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -974,6 +975,12 @@ private:
   EmbeddedRedis& db_;
   rocksdb::WriteBatch batch_;
   std::unordered_map<std::string, MetaValue> meta_cache_;
+  std::unordered_set<std::string> deleted_meta_cache_;
+  std::unordered_set<std::string> reset_state_cache_;
+  std::unordered_map<std::string, std::optional<std::string>> string_state_cache_;
+  std::unordered_map<std::string, std::unordered_map<std::string, bool>> hash_field_state_cache_;
+  std::unordered_map<std::string, std::unordered_map<std::string, bool>> set_member_state_cache_;
+  std::unordered_map<std::string, std::unordered_map<std::string, std::optional<double>>> zset_member_state_cache_;
   std::optional<ErrorCode> error_;
 
   /** @brief キャッシュ付きメタデータ取得 */
@@ -981,6 +988,21 @@ private:
 
   /** @brief キャッシュを更新 */
   void update_meta_cache(std::string_view key, MetaValue const& meta);
+
+  /** @brief 同一キーの補助キャッシュを消去 */
+  void clear_state_cache(std::string_view key);
+
+  /** @brief 文字列値を取得し、必要ならキャッシュする */
+  auto get_string_value_cached(std::string_view key) -> std::optional<std::string>;
+
+  /** @brief ハッシュフィールドの存在を取得し、必要ならキャッシュする */
+  auto get_hash_field_exists_cached(std::string_view key, uint64_t version, std::string_view field) -> bool;
+
+  /** @brief セットメンバーの存在を取得し、必要ならキャッシュする */
+  auto get_set_member_exists_cached(std::string_view key, uint64_t version, std::string_view member) -> bool;
+
+  /** @brief ZSet メンバーのスコアを取得し、必要ならキャッシュする */
+  auto get_zset_member_score_cached(std::string_view key, uint64_t version, std::string_view member) -> std::optional<double>;
 
   /** @brief Pipeline 内エラーを記録（最初のエラーのみ保持） */
   void set_error(ErrorCode e) { if (!error_) error_ = e; }

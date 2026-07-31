@@ -391,6 +391,146 @@ TEST_CASE_METHOD(DbFixture, "Pipeline exec clears pending ops on error so pipeli
   REQUIRE(*got == "1");
 }
 
+TEST_CASE_METHOD(DbFixture, "Pipeline keeps same-key collection metadata consistent within one batch") {
+  auto pipe = db.pipeline();
+  pipe.hset("h", "f", "1");
+  pipe.hset("h", "f", "2");
+  pipe.sadd("s", "a");
+  pipe.sadd("s", "a");
+  pipe.zadd("z", 1.0, "member");
+  pipe.zadd("z", 2.0, "member");
+
+  auto res = pipe.exec();
+  REQUIRE(res.has_value());
+
+  auto hlen = db.hlen("h");
+  REQUIRE(hlen.has_value());
+  REQUIRE(*hlen == 1);
+  auto hget = db.hget("h", "f");
+  REQUIRE(hget.has_value());
+  REQUIRE(*hget == "2");
+
+  auto scard = db.scard("s");
+  REQUIRE(scard.has_value());
+  REQUIRE(*scard == 1);
+
+  auto zcard = db.zcard("z");
+  REQUIRE(zcard.has_value());
+  REQUIRE(*zcard == 1);
+  auto zr = db.zrangebyscore("z", 2.0, 2.0);
+  REQUIRE(zr.has_value());
+  REQUIRE(zr->size() == 1);
+  REQUIRE((*zr)[0] == "member");
+}
+
+TEST_CASE_METHOD(DbFixture, "Pipeline handles delete and recreate of same collection key in one batch") {
+  std::ignore = db.hset("h", "old", "1");
+  std::ignore = db.sadd("s", "old");
+  std::ignore = db.zadd("z", 1.0, "old");
+
+  auto pipe = db.pipeline();
+  pipe.hdel("h", "old");
+  pipe.hset("h", "old", "2");
+  pipe.srem("s", "old");
+  pipe.sadd("s", "old");
+  pipe.zrem("z", "old");
+  pipe.zadd("z", 2.0, "old");
+
+  auto res = pipe.exec();
+  REQUIRE(res.has_value());
+
+  auto hlen = db.hlen("h");
+  REQUIRE(hlen.has_value());
+  REQUIRE(*hlen == 1);
+  auto hget = db.hget("h", "old");
+  REQUIRE(hget.has_value());
+  REQUIRE(*hget == "2");
+
+  auto scard = db.scard("s");
+  REQUIRE(scard.has_value());
+  REQUIRE(*scard == 1);
+  auto members = db.smembers("s");
+  REQUIRE(members.has_value());
+  REQUIRE(members->size() == 1);
+  REQUIRE((*members)[0] == "old");
+
+  auto zcard = db.zcard("z");
+  REQUIRE(zcard.has_value());
+  REQUIRE(*zcard == 1);
+  auto zr = db.zrangebyscore("z", 2.0, 2.0);
+  REQUIRE(zr.has_value());
+  REQUIRE(zr->size() == 1);
+  REQUIRE((*zr)[0] == "old");
+}
+
+TEST_CASE_METHOD(DbFixture, "Pipeline xadd WrongType prevents exec") {
+  std::ignore = db.set("streamish", "value");
+
+  auto pipe = db.pipeline();
+  pipe.xadd("streamish", "*", {});
+  auto res = pipe.exec();
+  REQUIRE_FALSE(res.has_value());
+  REQUIRE(res.error() == redismm::ErrorCode::WrongType);
+
+  auto got = db.get("streamish");
+  REQUIRE(got.has_value());
+  REQUIRE(*got == "value");
+}
+
+TEST_CASE_METHOD(DbFixture, "Strict numeric parsing rejects trailing garbage") {
+  std::ignore = db.set("int-key", "12abc");
+  auto incr_res = db.incr("int-key");
+  REQUIRE_FALSE(incr_res.has_value());
+  REQUIRE(incr_res.error() == redismm::ErrorCode::WrongType);
+
+  std::ignore = db.set("float-key", "3.14x");
+  auto float_res = db.incrbyfloat("float-key", 0.5);
+  REQUIRE_FALSE(float_res.has_value());
+  REQUIRE(float_res.error() == redismm::ErrorCode::WrongType);
+
+  std::ignore = db.hset("hash", "field", "7zzz");
+  auto hincr_res = db.hincrby("hash", "field", 1);
+  REQUIRE_FALSE(hincr_res.has_value());
+  REQUIRE(hincr_res.error() == redismm::ErrorCode::WrongType);
+}
+
+TEST_CASE_METHOD(DbFixture, "RPOPLPUSH on same key rotates list") {
+  std::ignore = db.rpush("q", "a");
+  std::ignore = db.rpush("q", "b");
+  std::ignore = db.rpush("q", "c");
+
+  auto moved = db.rpoplpush("q", "q");
+  REQUIRE(moved.has_value());
+  REQUIRE(*moved == "c");
+
+  auto len = db.llen("q");
+  REQUIRE(len.has_value());
+  REQUIRE(*len == 3);
+
+  auto values = db.lrange("q", 0, -1);
+  REQUIRE(values.has_value());
+  REQUIRE(*values == std::vector<std::string>{"c", "a", "b"});
+}
+
+TEST_CASE_METHOD(DbFixture, "RPOPLPUSH on same key preserves list boundaries after gaps") {
+  std::ignore = db.rpush("q", "a");
+  std::ignore = db.rpush("q", "b");
+  std::ignore = db.rpush("q", "c");
+  std::ignore = db.lrem("q", 1, "b");
+
+  auto moved = db.rpoplpush("q", "q");
+  REQUIRE(moved.has_value());
+  REQUIRE(*moved == "c");
+
+  auto first = db.rpop("q");
+  REQUIRE(first.has_value());
+  REQUIRE(*first == "a");
+
+  auto second = db.rpop("q");
+  REQUIRE(second.has_value());
+  REQUIRE(*second == "c");
+}
+
 // ---- Generic ----
 
 TEST_CASE_METHOD(DbFixture, "Generic del/exists") {
