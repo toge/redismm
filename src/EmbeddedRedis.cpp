@@ -70,7 +70,31 @@ struct EmbeddedRedis::Impl {
    * @param batch 書き込みバッチ
    * @param pfx プレフィックス
    */
+  // compute the lexicographic successor of pfx (smallest key > all keys with prefix pfx)
+  static std::optional<std::string> next_prefix(std::string const& pfx)
+  {
+    if (pfx.empty()) return std::nullopt;
+    std::string s = pfx;
+    for (auto i = static_cast<int>(s.size()) - 1; i >= 0; --i) {
+      auto unsigned_byte = static_cast<unsigned char>(s[static_cast<std::size_t>(i)]);
+      if (unsigned_byte != 0xFF) {
+        s[static_cast<std::size_t>(i)] = static_cast<char>(unsigned_byte + 1);
+        s.resize(static_cast<std::size_t>(i) + 1);
+        return s;
+      }
+    }
+    return std::nullopt;
+  }
+
   void delete_by_prefix(rocksdb::WriteBatch& batch, std::string const& pfx) {
+    // Try efficient DeleteRange when possible
+    auto const end_opt = next_prefix(pfx);
+    if (end_opt) {
+      batch.DeleteRange(pfx, *end_opt);
+      return;
+    }
+
+    // Fallback: iterate and delete keys
     rocksdb::Slice const pfx_slice(pfx);
     rocksdb::ReadOptions opts;
     opts.fill_cache = false;
@@ -1665,6 +1689,15 @@ auto EmbeddedRedis::linsert(std::string_view key, InsertPosition pos, std::strin
   meta->tail_seq = base + vals.size();
   meta->size = vals.size();
   impl_->put_meta(batch, key, *meta);
+
+  // CAS protection: ensure meta.version was not changed by concurrent writers
+  auto const current_meta = impl_->get_meta(key);
+  if (!current_meta) {
+    return std::unexpected(ErrorCode::NotFound);
+  }
+  if (current_meta->version != old_version) {
+    return std::unexpected(ErrorCode::Busy);
+  }
 
   if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
     return std::unexpected(ErrorCode::RocksDBError);

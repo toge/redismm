@@ -18,6 +18,7 @@ enum class ErrorCode {
   WrongType,       ///< 操作とキーのデータ型が一致しない
   RocksDBError,    ///< RocksDB の入出力エラー
   InvalidArgument, ///< 引数が不正（Stream ID のフォーマット違反など）
+  Busy,            ///< 操作が競合している（CAS 失敗など）
 };
 
 /** @brief エラーコードを伴う戻り値型 */
