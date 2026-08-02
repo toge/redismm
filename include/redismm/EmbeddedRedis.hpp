@@ -7,7 +7,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -43,6 +42,13 @@ enum class ListSide { Left, Right };
  * @details RocksDB をストレージエンジンとして使用し、文字列・ハッシュ・リスト・セット・
  *   ソート済みセット・ストリームの 6 データ型をサポートする。
  *   コンストラクタで DB を開き、失敗時は is_open() で検出可能。
+ *
+ *   **スレッド安全性**: 単一のインスタンスを複数スレッドから同時に使用できる。
+ *   各操作は RocksDB の OptimisticTransactionDB 上のトランザクションとして実行され、
+ *   read-modify-write（incr、sadd のサイズ更新など）は不可分に適用される。
+ *   同一キーへの並行操作が競合した場合は自動的に再実行され、再試行の上限に達した場合のみ
+ *   ErrorCode::Busy を返す。
+ * @note ムーブ操作は他スレッドと同時に行ってはならない。
  */
 class EmbeddedRedis {
 public:
@@ -92,6 +98,7 @@ public:
    * @param key   キー
    * @param value 追加する値
    * @return 追加後の文字列長
+   * @note 既存キーの TTL は維持される
    */
   auto append(std::string_view key, std::string_view value) -> Result<uint64_t>;
 
@@ -100,6 +107,7 @@ public:
    *
    * @param key キー
    * @return インクリメント後の値
+   * @note 既存キーの TTL は維持される
    */
   auto incr(std::string_view key) -> Result<int64_t>;
 
@@ -108,6 +116,7 @@ public:
    *
    * @param key キー
    * @return デクリメント後の値
+   * @note 既存キーの TTL は維持される
    */
   auto decr(std::string_view key) -> Result<int64_t>;
 
@@ -117,6 +126,7 @@ public:
    * @param key   キー
    * @param delta 増分
    * @return インクリメント後の値
+   * @note 既存キーの TTL は維持される
    */
   auto incrby(std::string_view key, int64_t delta) -> Result<int64_t>;
 
@@ -126,6 +136,7 @@ public:
    * @param key   キー
    * @param delta 減分
    * @return デクリメント後の値
+   * @note 既存キーの TTL は維持される
    */
   auto decrby(std::string_view key, int64_t delta) -> Result<int64_t>;
 
@@ -143,6 +154,7 @@ public:
    * @param key   キー
    * @param value 新しい値
    * @return 古い値。キーが存在しない場合は NotFound
+   * @note Redis と同様、TTL は破棄される
    */
   auto getset(std::string_view key, std::string_view value) -> Result<std::string>;
 
@@ -161,6 +173,7 @@ public:
    * @param key   キー
    * @param delta 増分
    * @return インクリメント後の値
+   * @note 既存キーの TTL は維持される
    */
   auto incrbyfloat(std::string_view key, double delta) -> Result<double>;
 
@@ -181,6 +194,7 @@ public:
    * @param offset 開始オフセット
    * @param value  上書きする値
    * @return 設定後の文字列長
+   * @note 既存キーの TTL は維持される
    */
   auto setrange(std::string_view key, uint64_t offset, std::string_view value) -> Result<uint64_t>;
 
@@ -209,7 +223,7 @@ public:
    * @brief ハッシュの全フィールドを取得する
    *
    * @param key キー
-   * @return フィールド名→値のマップ
+   * @return フィールド名→値のマップ。キーが存在しない場合は空
    */
   auto hgetall(std::string_view key) -> Result<std::unordered_map<std::string, std::string>>;
 
@@ -353,7 +367,7 @@ public:
    * @param key   キー
    * @param count 削除数（正: 先頭から、負: 末尾から、0: すべて）
    * @param value 削除する値
-   * @return 削除された要素数
+   * @return 削除された要素数。キーが存在しない場合は 0
    */
   auto lrem(std::string_view key, int64_t count, std::string_view value) -> Result<uint64_t>;
 
@@ -363,7 +377,7 @@ public:
    * @param key   キー
    * @param start 開始インデックス（0ベース、負の値は末尾から）
    * @param stop  終了インデックス（0ベース、負の値は末尾から、含む）
-   * @return 成功
+   * @return 成功。キーが存在しない場合も成功扱い
    */
   auto ltrim(std::string_view key, int64_t start, int64_t stop) -> Result<void>;
 
@@ -428,7 +442,8 @@ public:
    * @param pos   挿入位置（Before または After）
    * @param pivot ピボット値
    * @param value 挿入する値
-   * @return 挿入後のリストサイズ。ピボットが見つからない場合は NotFound
+   * @return 挿入後のリストサイズ。キーが存在しない場合は 0、
+   *   ピボットが見つからない場合は NotFound
    */
   auto linsert(std::string_view key, InsertPosition pos, std::string_view pivot, std::string_view value) -> Result<uint64_t>;
 
@@ -467,7 +482,7 @@ public:
    * @brief セットの全メンバーを取得する
    *
    * @param key キー
-   * @return メンバー一覧
+   * @return メンバー一覧。キーが存在しない場合は空
    */
   auto smembers(std::string_view key) -> Result<std::vector<std::string>>;
 
@@ -476,7 +491,7 @@ public:
    *
    * @param key    キー
    * @param member メンバー
-   * @return 削除されたら true、存在しなければ false
+   * @return 削除されたら true。キーまたはメンバーが存在しなければ false
    */
   auto srem(std::string_view key, std::string_view member) -> Result<bool>;
 
@@ -541,7 +556,7 @@ public:
    * @param key       キー
    * @param min_score 最小スコア（含む）
    * @param max_score 最大スコア（含む）
-   * @return メンバー一覧
+   * @return メンバー一覧。キーが存在しない場合は空
    */
   auto zrangebyscore(std::string_view key, double min_score, double max_score) -> Result<std::vector<std::string>>;
 
@@ -623,9 +638,9 @@ public:
    * @brief ランク範囲でメンバーを取得する（降順）
    *
    * @param key   キー
-   * @param start 開始ランク（0ベース）
-   * @param stop  終了ランク（0ベース、含む）
-   * @return メンバー一覧
+   * @param start 開始ランク（0ベース、負の値は末尾から）
+   * @param stop  終了ランク（0ベース、負の値は末尾から、含む）
+   * @return メンバー一覧。範囲が要素数を超える場合は空（zrange と同じ丸め方）
    */
   auto zrevrange(std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>>;
 
@@ -885,30 +900,31 @@ private:
 // Pipeline
 // ============================================================
 
-#include "redismm/Encoder.hpp"
-
-#include <functional>
-#include <unordered_map>
-#include <rocksdb/write_batch.h>
+namespace rocksdb {
+class Transaction;
+} // namespace rocksdb
 
 namespace redismm {
 
 /**
- * @brief 複数の書き込み操作をバッチで実行する Pipeline
+ * @brief 複数の書き込み操作をまとめて実行する Pipeline
  *
- * @details 操作をキューイングし、exec() で一括実行する。
- *   すべての操作は単一の RocksDB WriteBatch でアトミックに実行される。
- *   同じキーへの連続操作はメタデータキャッシュにより正しく処理される。
+ * @details 各操作は単一のトランザクションに積まれ、exec() でアトミックにコミットされる。
+ *   トランザクションは未コミットの書き込みを読み戻せるため、同じキーへの連続操作
+ *   （例: rpush してから lrem）も一貫した結果になる。
+ *   exec() を呼ぶまで DB には一切反映されない。
+ * @note コミット時に他スレッドと競合した場合は ErrorCode::Busy を返す。
+ *   Pipeline は利用者が組み立てた内容なので自動では再実行しない。
  */
 class EmbeddedRedis::Pipeline {
 public:
-  explicit Pipeline(EmbeddedRedis& db) : db_(db) {}
-  ~Pipeline() = default;
+  explicit Pipeline(EmbeddedRedis& db);
+  ~Pipeline();
 
   Pipeline(Pipeline const&)            = delete;
   Pipeline& operator=(Pipeline const&) = delete;
-  Pipeline(Pipeline&&)                 = default;
-  Pipeline& operator=(Pipeline&&)      = default;
+  Pipeline(Pipeline&&) noexcept;
+  Pipeline& operator=(Pipeline&&) = delete; ///< 参照メンバを持つため再代入はできない
 
   /** @brief 文字列値を設定する操作を追加 */
   Pipeline& set(std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms = std::nullopt);
@@ -962,50 +978,30 @@ public:
   Pipeline& ltrim(std::string_view key, int64_t start, int64_t stop);
 
   /**
-   * @brief キューイングされた操作を一括実行する
+   * @brief 積まれた操作を一括コミットする
    *
-   * @return すべての操作が成功すれば成功
+   * @return すべての操作が成功すれば成功。競合時は Busy
+   * @note 成否にかかわらず、戻った時点で Pipeline は空になり再利用できる
    */
   auto exec() -> Result<void>;
 
-  /** @brief キューをクリアする */
+  /** @brief 積まれた操作を破棄する */
   void clear();
 
 private:
-  EmbeddedRedis& db_;
-  rocksdb::WriteBatch batch_;
-  std::unordered_map<std::string, MetaValue> meta_cache_;
-  std::unordered_set<std::string> deleted_meta_cache_;
-  std::unordered_set<std::string> reset_state_cache_;
-  std::unordered_map<std::string, std::optional<std::string>> string_state_cache_;
-  std::unordered_map<std::string, std::unordered_map<std::string, bool>> hash_field_state_cache_;
-  std::unordered_map<std::string, std::unordered_map<std::string, bool>> set_member_state_cache_;
-  std::unordered_map<std::string, std::unordered_map<std::string, std::optional<double>>> zset_member_state_cache_;
-  std::optional<ErrorCode> error_;
+  EmbeddedRedis&                        db_;
+  std::unique_ptr<rocksdb::Transaction> txn_; ///< DB が開けていない場合は nullptr
+  std::optional<ErrorCode>              error_;
 
-  /** @brief キャッシュ付きメタデータ取得 */
-  auto get_meta_cached(std::string_view key) -> std::optional<MetaValue>;
-
-  /** @brief キャッシュを更新 */
-  void update_meta_cache(std::string_view key, MetaValue const& meta);
-
-  /** @brief 同一キーの補助キャッシュを消去 */
-  void clear_state_cache(std::string_view key);
-
-  /** @brief 文字列値を取得し、必要ならキャッシュする */
-  auto get_string_value_cached(std::string_view key) -> std::optional<std::string>;
-
-  /** @brief ハッシュフィールドの存在を取得し、必要ならキャッシュする */
-  auto get_hash_field_exists_cached(std::string_view key, uint64_t version, std::string_view field) -> bool;
-
-  /** @brief セットメンバーの存在を取得し、必要ならキャッシュする */
-  auto get_set_member_exists_cached(std::string_view key, uint64_t version, std::string_view member) -> bool;
-
-  /** @brief ZSet メンバーのスコアを取得し、必要ならキャッシュする */
-  auto get_zset_member_score_cached(std::string_view key, uint64_t version, std::string_view member) -> std::optional<double>;
+  /** @brief 操作を積めるか（DB が開いていてエラー未発生か）判定する */
+  [[nodiscard]] bool usable() const noexcept;
 
   /** @brief Pipeline 内エラーを記録（最初のエラーのみ保持） */
-  void set_error(ErrorCode e) { if (!error_) error_ = e; }
+  void set_error(ErrorCode e) {
+    if (!error_) {
+      error_ = e;
+    }
+  }
 };
 
 } // namespace redismm

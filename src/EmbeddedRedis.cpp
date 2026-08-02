@@ -3,17 +3,23 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <format>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string>
+#include <thread>
+#include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
-#include <rocksdb/write_batch.h>
+#include <rocksdb/utilities/optimistic_transaction_db.h>
+#include <rocksdb/utilities/transaction.h>
 
 namespace redismm {
 
@@ -25,28 +31,143 @@ bool parse_number_strict(std::string_view raw, T& value) {
   return ec == std::errc{} && ptr == raw.data() + raw.size();
 }
 
+/**
+ * @brief スレッドローカルな乱数生成器
+ * @details rand() と異なりスレッドセーフで、分布の偏りもない
+ */
+std::mt19937_64& rng() {
+  static thread_local std::mt19937_64 gen{std::random_device{}()};
+  return gen;
+}
+
+/** @brief [0, n) の一様乱数 @param n 上限（排他） @return 乱数 */
+uint64_t random_below(uint64_t n) {
+  return std::uniform_int_distribution<uint64_t>(0, n - 1)(rng());
+}
+
+/**
+ * @brief 競合後の再試行前に待機する
+ * @details バックオフ無しで再突入すると、競合したスレッド同士が同期したまま
+ *          衝突し続けてライブロックする。指数的に広がる窓からランダムに選ぶ
+ *          ことで再突入のタイミングをばらけさせる。
+ * @param attempt 0 起算の試行回数
+ */
+void backoff(int attempt) {
+  auto const slots = 1ULL << std::min(attempt, 10); // 上限は約 1ms
+  std::this_thread::sleep_for(std::chrono::microseconds(random_below(slots) + 1));
+}
+
 } // namespace
 
-/** @brief Pimpl 実装：RocksDB のラッパーと内部操作 */
+/**
+ * @brief Pimpl 実装：RocksDB のラッパーと内部操作
+ * @details すべての操作は OptimisticTransactionDB のトランザクション内で実行される。
+ *   メタキーを GetForUpdate で読むことで、同一キーに対する並行操作は
+ *   コミット時に競合として検出され、run_txn が自動的に再実行する。
+ */
 struct EmbeddedRedis::Impl {
-  rocksdb::DB*          db         = nullptr; ///< RocksDB インスタンス
-  rocksdb::WriteOptions write_opts = {};       ///< 書き込みオプション
-  rocksdb::ReadOptions  read_opts  = {};       ///< 読み取りオプション
+  rocksdb::OptimisticTransactionDB* txn_db     = nullptr; ///< RocksDB インスタンス（所有）
+  rocksdb::WriteOptions             write_opts = {};      ///< 書き込みオプション
+  rocksdb::ReadOptions              read_opts  = {};      ///< 読み取りオプション
+
+  /**
+   * @brief 競合時に同一操作を再実行する上限回数
+   * @details 楽観ロックでは 1 ラウンドにつき勝者は 1 スレッドだけなので、
+   *   ホットキーでは連敗しうる。backoff() の待ちが上限に達した状態でも
+   *   合計待ち時間は 0.3 秒程度に収まる。これを超えても解消しない場合のみ
+   *   ErrorCode::Busy を返す。
+   */
+  static constexpr int kMaxRetries = 256;
 
   ~Impl() {
-    delete db;
+    delete txn_db;
   }
 
   /**
-   * @brief キーのメタデータを取得する（期限切れなら遅延削除後 nullopt を返す）
+   * @brief トランザクション内で操作を実行し、競合時は再実行する
    *
-   * @param key ユーザーキー
-   * @return メタデータ。キーが存在しないか期限切れなら nullopt
+   * @param fn rocksdb::Transaction& を受け取り Result<T> を返す呼び出し可能オブジェクト
+   * @return fn の戻り値。競合が解消しなければ ErrorCode::Busy
+   * @note fn は複数回呼ばれうるため、副作用はトランザクションの中だけに閉じている必要がある
    */
-  std::optional<MetaValue> get_meta(std::string_view key) {
-    auto const mk = encode_meta_key(key);
+  template <typename Fn>
+  auto run_txn(Fn&& fn) -> std::invoke_result_t<Fn, rocksdb::Transaction&> {
+    using R = std::invoke_result_t<Fn, rocksdb::Transaction&>;
+    if (txn_db == nullptr) {
+      return R(std::unexpected(ErrorCode::RocksDBError));
+    }
+
+    rocksdb::OptimisticTransactionOptions txn_opts;
+    txn_opts.set_snapshot = true; // 操作中は一貫したスナップショットを見る
+
+    std::unique_ptr<rocksdb::Transaction> txn;
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+      // 2 回目以降は Transaction オブジェクトを再利用して割り当てを避ける
+      txn.reset(txn_db->BeginTransaction(write_opts, txn_opts, txn.release()));
+
+      R result = fn(*txn);
+      if (!result) {
+        std::ignore = txn->Rollback();
+        return result;
+      }
+
+      auto const s = txn->Commit();
+      if (s.ok()) {
+        return result;
+      }
+      if (s.IsBusy() || s.IsTryAgain()) {
+        backoff(attempt);
+        continue; // 他スレッドと競合した。操作全体をやり直す
+      }
+      return R(std::unexpected(ErrorCode::RocksDBError));
+    }
+    return R(std::unexpected(ErrorCode::Busy));
+  }
+
+  /** @brief トランザクションのスナップショットを使う点読み取りオプション */
+  static rocksdb::ReadOptions snap_opts(rocksdb::Transaction& txn) {
+    rocksdb::ReadOptions ro;
+    ro.snapshot = txn.GetSnapshot();
+    return ro;
+  }
+
+  /** @brief トランザクションのスナップショットを使う走査用オプション（キャッシュ汚染を避ける） */
+  static rocksdb::ReadOptions snap_iter_opts(rocksdb::Transaction& txn) {
+    auto ro       = snap_opts(txn);
+    ro.fill_cache = false;
+    return ro;
+  }
+
+  /**
+   * @brief 書き込みパス用のメタデータ取得
+   * @details GetForUpdate でメタキーを競合検出の対象に登録する。これにより同一キーへの
+   *   並行操作はコミット時に必ず衝突し、run_txn が再実行する。
+   * @param txn トランザクション
+   * @param key ユーザーキー
+   * @return メタデータ。存在しないか期限切れなら nullopt（期限切れデータは同一トランザクションで削除）
+   */
+  std::optional<MetaValue> get_meta(rocksdb::Transaction& txn, std::string_view key) {
     std::string raw;
-    auto const s = db->Get(read_opts, mk, &raw);
+    auto const  s = txn.GetForUpdate(snap_opts(txn), encode_meta_key(key), &raw);
+    return finish_get_meta(txn, key, s, raw);
+  }
+
+  /**
+   * @brief 読み取りパス用のメタデータ取得
+   * @details 競合検出の対象にしないため、読み取り操作が Busy で失敗することはない
+   * @param txn トランザクション
+   * @param key ユーザーキー
+   * @return メタデータ。存在しないか期限切れなら nullopt
+   */
+  std::optional<MetaValue> get_meta_ro(rocksdb::Transaction& txn, std::string_view key) {
+    std::string raw;
+    auto const  s = txn.Get(snap_opts(txn), encode_meta_key(key), &raw);
+    return finish_get_meta(txn, key, s, raw);
+  }
+
+  /** @brief get_meta / get_meta_ro 共通の後処理（デコードと期限切れ判定） */
+  std::optional<MetaValue> finish_get_meta(rocksdb::Transaction& txn, std::string_view key, rocksdb::Status const& s,
+                                           std::string const& raw) {
     if (!s.ok()) {
       return std::nullopt;
     }
@@ -55,96 +176,98 @@ struct EmbeddedRedis::Impl {
       return std::nullopt;
     }
     if (is_expired(*meta)) {
-      rocksdb::WriteBatch batch;
-      erase_key_data(batch, key, *meta);
-      std::ignore = db->Write(write_opts, &batch);
+      erase_key_data(txn, key, *meta); // 期限切れは見つけた時点で回収する
       return std::nullopt;
     }
     return meta;
   }
 
   /**
-   * @brief メタデータを WriteBatch に書き込む
+   * @brief メタデータをトランザクションに書き込む
    *
-   * @param batch 書き込みバッチ
+   * @param txn トランザクション
    * @param key ユーザーキー
    * @param meta メタデータ
    */
-  void put_meta(rocksdb::WriteBatch& batch, std::string_view key, MetaValue const& meta) {
-    batch.Put(encode_meta_key(key), encode_meta_value(meta));
+  void put_meta(rocksdb::Transaction& txn, std::string_view key, MetaValue const& meta) {
+    std::ignore = txn.Put(encode_meta_key(key), encode_meta_value(meta));
   }
 
   /**
-   * @brief プレフィックスに合致する全キーを削除する（WriteBatch に積む）
+   * @brief プレフィックスに合致する全キーを削除する
    *
-   * @param batch 書き込みバッチ
+   * @param txn トランザクション
    * @param pfx プレフィックス
+   * @note OptimisticTransactionDB は DeleteRange を受け付けないため、走査して個別に削除する
    */
-  // compute the lexicographic successor of pfx (smallest key > all keys with prefix pfx)
-  static std::optional<std::string> next_prefix(std::string const& pfx)
-  {
-    if (pfx.empty()) return std::nullopt;
-    std::string s = pfx;
-    for (auto i = static_cast<int>(s.size()) - 1; i >= 0; --i) {
-      auto unsigned_byte = static_cast<unsigned char>(s[static_cast<std::size_t>(i)]);
-      if (unsigned_byte != 0xFF) {
-        s[static_cast<std::size_t>(i)] = static_cast<char>(unsigned_byte + 1);
-        s.resize(static_cast<std::size_t>(i) + 1);
-        return s;
-      }
-    }
-    return std::nullopt;
-  }
-
-  void delete_by_prefix(rocksdb::WriteBatch& batch, std::string const& pfx) {
-    // Try efficient DeleteRange when possible
-    auto const end_opt = next_prefix(pfx);
-    if (end_opt) {
-      batch.DeleteRange(pfx, *end_opt);
-      return;
-    }
-
-    // Fallback: iterate and delete keys
-    rocksdb::Slice const pfx_slice(pfx);
-    rocksdb::ReadOptions opts;
-    opts.fill_cache = false;
-    std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(opts));
+  void delete_by_prefix(rocksdb::Transaction& txn, std::string const& pfx) {
+    rocksdb::Slice const               pfx_slice(pfx);
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(snap_iter_opts(txn)));
     for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
       if (!it->key().starts_with(pfx_slice)) {
         break;
       }
-      batch.Delete(it->key());
+      std::ignore = txn.Delete(it->key());
     }
   }
+
+  // ---- 引数を書き換える操作の実体 ----
+  // run_txn は競合時に同じラムダを再呼び出しするため、ラムダ内で値渡し引数を書き換えると
+  // 変更が次の試行に持ち越されてしまう。関数の引数として毎回コピーを渡すことで防ぐ。
+  auto getrange(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t end) -> Result<std::string>;
+  auto lrange(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>>;
+  auto lindex(rocksdb::Transaction& txn, std::string_view key, int64_t index) -> Result<std::string>;
+  auto lset(rocksdb::Transaction& txn, std::string_view key, int64_t index, std::string_view value) -> Result<void>;
+  auto zrange(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>>;
+  auto zrevrange(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>>;
+  auto zremrangebyrank(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<uint64_t>;
+
+  // ---- Pipeline と共有する操作の実体（同じロジックを二度書かないための集約） ----
+  auto set(rocksdb::Transaction& txn, std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms) -> Result<void>;
+  auto append(rocksdb::Transaction& txn, std::string_view key, std::string_view value) -> Result<uint64_t>;
+  auto hset(rocksdb::Transaction& txn, std::string_view key, std::string_view field, std::string_view value) -> Result<bool>;
+  auto hdel(rocksdb::Transaction& txn, std::string_view key, std::string_view field) -> Result<bool>;
+  auto lpush(rocksdb::Transaction& txn, std::string_view key, std::string_view value) -> Result<uint64_t>;
+  auto rpush(rocksdb::Transaction& txn, std::string_view key, std::string_view value) -> Result<uint64_t>;
+  auto lrem(rocksdb::Transaction& txn, std::string_view key, int64_t count, std::string_view value) -> Result<uint64_t>;
+  auto ltrim(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<void>;
+  auto sadd(rocksdb::Transaction& txn, std::string_view key, std::string_view member) -> Result<bool>;
+  auto srem(rocksdb::Transaction& txn, std::string_view key, std::string_view member) -> Result<bool>;
+  auto zadd(rocksdb::Transaction& txn, std::string_view key, double score, std::string_view member) -> Result<bool>;
+  auto zrem(rocksdb::Transaction& txn, std::string_view key, std::string_view member) -> Result<bool>;
+  auto xadd(rocksdb::Transaction& txn, std::string_view key, std::string_view id, std::vector<std::pair<std::string, std::string>> const& fields) -> Result<std::string>;
+  auto del(rocksdb::Transaction& txn, std::string_view key) -> Result<bool>;
+  auto pexpire(rocksdb::Transaction& txn, std::string_view key, uint64_t milliseconds) -> Result<bool>;
+  auto persist(rocksdb::Transaction& txn, std::string_view key) -> Result<bool>;
 
   /**
    * @brief キーに関連する全データ（メタ＋データ）を削除する
    *
-   * @param batch 書き込みバッチ
+   * @param txn トランザクション
    * @param key ユーザーキー
    * @param meta メタデータ
    */
-  void erase_key_data(rocksdb::WriteBatch& batch, std::string_view key, MetaValue const& meta) {
-    batch.Delete(encode_meta_key(key));
+  void erase_key_data(rocksdb::Transaction& txn, std::string_view key, MetaValue const& meta) {
+    std::ignore = txn.Delete(encode_meta_key(key));
     switch (meta.type) {
     case DataType::String:
-      batch.Delete(encode_string_key(key));
+      std::ignore = txn.Delete(encode_string_key(key));
       break;
     case DataType::Hash:
-      delete_by_prefix(batch, encode_hash_prefix(key, meta.version));
+      delete_by_prefix(txn, encode_hash_prefix(key, meta.version));
       break;
     case DataType::List:
-      delete_by_prefix(batch, encode_list_prefix(key, meta.version));
+      delete_by_prefix(txn, encode_list_prefix(key, meta.version));
       break;
     case DataType::Set:
-      delete_by_prefix(batch, encode_set_prefix(key, meta.version));
+      delete_by_prefix(txn, encode_set_prefix(key, meta.version));
       break;
     case DataType::ZSet:
-      delete_by_prefix(batch, encode_zset_member_prefix(key, meta.version));
-      delete_by_prefix(batch, encode_zset_score_range_prefix(key, meta.version));
+      delete_by_prefix(txn, encode_zset_member_prefix(key, meta.version));
+      delete_by_prefix(txn, encode_zset_score_range_prefix(key, meta.version));
       break;
     case DataType::Stream:
-      delete_by_prefix(batch, encode_stream_prefix(key, meta.version));
+      delete_by_prefix(txn, encode_stream_prefix(key, meta.version));
       break;
     }
   }
@@ -160,17 +283,17 @@ struct EmbeddedRedis::Impl {
  * @param db_path RocksDB のパス。ディレクトリがなければ作成される
  */
 EmbeddedRedis::EmbeddedRedis(std::string_view db_path) : impl_(std::make_unique<Impl>()) {
-  rocksdb::Options              opts;
+  rocksdb::Options opts;
   opts.create_if_missing = true;
   opts.compression       = rocksdb::kNoCompression;
 
-  std::unique_ptr<rocksdb::DB> raw_db;
-  auto const                   status = rocksdb::DB::Open(opts, std::string(db_path), &raw_db);
+  rocksdb::OptimisticTransactionDB* raw_db = nullptr;
+  auto const status = rocksdb::OptimisticTransactionDB::Open(opts, std::string(db_path), &raw_db);
   if (!status.ok()) {
     std::cerr << std::format("[EmbeddedRedis] DB::Open failed: {}\n", status.ToString());
     return;
   }
-  impl_->db = raw_db.release();
+  impl_->txn_db = raw_db;
 }
 
 EmbeddedRedis::~EmbeddedRedis() = default;
@@ -183,7 +306,7 @@ EmbeddedRedis& EmbeddedRedis::operator=(EmbeddedRedis&&) noexcept = default;
  * @return DB が利用可能なら true
  */
 bool EmbeddedRedis::is_open() const noexcept {
-  return impl_ && impl_->db != nullptr;
+  return impl_ && impl_->txn_db != nullptr;
 }
 
 // ============================================================
@@ -195,18 +318,14 @@ bool EmbeddedRedis::is_open() const noexcept {
  *
  * @copydoc EmbeddedRedis::set
  */
-auto EmbeddedRedis::set(std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms) -> Result<void> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
+/** @brief set の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::set(rocksdb::Transaction& txn, std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms) -> Result<void> {
 
-  auto existing = impl_->get_meta(key);
-
-  rocksdb::WriteBatch batch;
+  auto existing = get_meta(txn, key);
 
   // 既存キーが別の型なら先に全削除する
   if (existing && existing->type != DataType::String) {
-    impl_->erase_key_data(batch, key, *existing);
+    erase_key_data(txn, key, *existing);
     existing = std::nullopt;
   }
 
@@ -216,13 +335,16 @@ auto EmbeddedRedis::set(std::string_view key, std::string_view value, std::optio
   meta.size          = value.size();
   meta.expiration_ms = ttl_ms ? now_ms() + *ttl_ms : 0;
 
-  impl_->put_meta(batch, key, meta);
-  batch.Put(encode_string_key(key), rocksdb::Slice(value.data(), value.size()));
+  put_meta(txn, key, meta);
+  std::ignore = txn.Put(encode_string_key(key), rocksdb::Slice(value.data(), value.size()));
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return {};
+}
+
+auto EmbeddedRedis::set(std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms) -> Result<void> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<void> {
+    return impl_->set(txn, key, value, ttl_ms);
+  });
 }
 
 /**
@@ -231,22 +353,21 @@ auto EmbeddedRedis::set(std::string_view key, std::string_view value, std::optio
  * @copydoc EmbeddedRedis::get
  */
 auto EmbeddedRedis::get(std::string_view key) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::String) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::String) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  std::string value;
-  if (!impl_->db->Get(impl_->read_opts, encode_string_key(key), &value).ok()) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  return value;
+    std::string value;
+    if (!txn.Get(Impl::snap_opts(txn), encode_string_key(key), &value).ok()) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    return value;
+  });
 }
 
 /**
@@ -254,35 +375,37 @@ auto EmbeddedRedis::get(std::string_view key) -> Result<std::string> {
  *
  * @copydoc EmbeddedRedis::append
  */
-auto EmbeddedRedis::append(std::string_view key, std::string_view value) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
+/** @brief append の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::append(rocksdb::Transaction& txn, std::string_view key, std::string_view value) -> Result<uint64_t> {
+  auto existing = get_meta(txn, key);
   if (existing && existing->type != DataType::String) {
     return std::unexpected(ErrorCode::WrongType);
   }
 
   std::string current;
   if (existing) {
-    impl_->db->Get(impl_->read_opts, encode_string_key(key), &current);
+    std::ignore = txn.Get(snap_opts(txn), encode_string_key(key), &current);
   }
 
   current += value;
 
-  rocksdb::WriteBatch batch;
   MetaValue meta;
   meta.type    = DataType::String;
   meta.version = existing ? existing->version : 1;
+  // Redis 互換: 値を書き換えるだけの操作は TTL を維持する
+  meta.expiration_ms = existing ? existing->expiration_ms : 0;
   meta.size    = current.size();
 
-  impl_->put_meta(batch, key, meta);
-  batch.Put(encode_string_key(key), rocksdb::Slice(current));
+  put_meta(txn, key, meta);
+  std::ignore = txn.Put(encode_string_key(key), rocksdb::Slice(current));
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return static_cast<uint64_t>(current.size());
+}
+
+auto EmbeddedRedis::append(std::string_view key, std::string_view value) -> Result<uint64_t> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    return impl_->append(txn, key, value);
+  });
 }
 
 /**
@@ -309,40 +432,37 @@ auto EmbeddedRedis::decr(std::string_view key) -> Result<int64_t> {
  * @copydoc EmbeddedRedis::incrby
  */
 auto EmbeddedRedis::incrby(std::string_view key, int64_t delta) -> Result<int64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
-  if (existing && existing->type != DataType::String) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<int64_t> {
+    auto existing = impl_->get_meta(txn, key);
+    if (existing && existing->type != DataType::String) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  int64_t val = 0;
-  if (existing) {
-    std::string raw;
-    if (impl_->db->Get(impl_->read_opts, encode_string_key(key), &raw).ok()) {
-      if (!parse_number_strict(raw, val)) {
-        return std::unexpected(ErrorCode::WrongType);
+    int64_t val = 0;
+    if (existing) {
+      std::string raw;
+      if (txn.Get(Impl::snap_opts(txn), encode_string_key(key), &raw).ok()) {
+        if (!parse_number_strict(raw, val)) {
+          return std::unexpected(ErrorCode::WrongType);
+        }
       }
     }
-  }
 
-  val += delta;
-  auto const new_str = std::to_string(val);
+    val += delta;
+    auto const new_str = std::to_string(val);
 
-  rocksdb::WriteBatch batch;
-  MetaValue meta;
-  meta.type    = DataType::String;
-  meta.version = existing ? existing->version : 1;
-  meta.size    = new_str.size();
+    MetaValue meta;
+    meta.type    = DataType::String;
+    meta.version = existing ? existing->version : 1;
+    // Redis 互換: 値を書き換えるだけの操作は TTL を維持する
+    meta.expiration_ms = existing ? existing->expiration_ms : 0;
+    meta.size    = new_str.size();
 
-  impl_->put_meta(batch, key, meta);
-  batch.Put(encode_string_key(key), new_str);
+    impl_->put_meta(txn, key, meta);
+    std::ignore = txn.Put(encode_string_key(key), new_str);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return val;
+    return val;
+  });
 }
 
 /**
@@ -360,17 +480,16 @@ auto EmbeddedRedis::decrby(std::string_view key, int64_t delta) -> Result<int64_
  * @copydoc EmbeddedRedis::strlen
  */
 auto EmbeddedRedis::strlen(std::string_view key) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::String) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  return meta->size;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return 0;
+    }
+    if (meta->type != DataType::String) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    return meta->size;
+  });
 }
 
 // ---- New String Functions ----
@@ -381,31 +500,27 @@ auto EmbeddedRedis::strlen(std::string_view key) -> Result<uint64_t> {
  * @copydoc EmbeddedRedis::getset
  */
 auto EmbeddedRedis::getset(std::string_view key, std::string_view value) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
-  if (existing && existing->type != DataType::String) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto existing = impl_->get_meta(txn, key);
+    if (existing && existing->type != DataType::String) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  std::string old;
-  if (!existing) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+    std::string old;
+    if (!existing) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  impl_->db->Get(impl_->read_opts, encode_string_key(key), &old);
+    std::ignore = txn.Get(Impl::snap_opts(txn), encode_string_key(key), &old);
 
-  rocksdb::WriteBatch batch;
-  MetaValue meta = *existing;
-  meta.size = value.size();
-  impl_->put_meta(batch, key, meta);
-  batch.Put(encode_string_key(key), rocksdb::Slice(value.data(), value.size()));
+    MetaValue meta      = *existing;
+    meta.size           = value.size();
+    meta.expiration_ms  = 0; // Redis 互換: GETSET は値を置き換えるので TTL を破棄する
+    impl_->put_meta(txn, key, meta);
+    std::ignore = txn.Put(encode_string_key(key), rocksdb::Slice(value.data(), value.size()));
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return old;
+    return old;
+  });
 }
 
 /**
@@ -414,30 +529,25 @@ auto EmbeddedRedis::getset(std::string_view key, std::string_view value) -> Resu
  * @copydoc EmbeddedRedis::setnx
  */
 auto EmbeddedRedis::setnx(std::string_view key, std::string_view value) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
-  if (existing) {
-    if (existing->type != DataType::String) {
-      return std::unexpected(ErrorCode::WrongType);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    auto existing = impl_->get_meta(txn, key);
+    if (existing) {
+      if (existing->type != DataType::String) {
+        return std::unexpected(ErrorCode::WrongType);
+      }
+      return false;
     }
-    return false;
-  }
 
-  MetaValue meta;
-  meta.type    = DataType::String;
-  meta.version = 1;
-  meta.size    = value.size();
+    MetaValue meta;
+    meta.type    = DataType::String;
+    meta.version = 1;
+    meta.size    = value.size();
 
-  rocksdb::WriteBatch batch;
-  impl_->put_meta(batch, key, meta);
-  batch.Put(encode_string_key(key), rocksdb::Slice(value.data(), value.size()));
+    impl_->put_meta(txn, key, meta);
+    std::ignore = txn.Put(encode_string_key(key), rocksdb::Slice(value.data(), value.size()));
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return true;
+    return true;
+  });
 }
 
 /**
@@ -446,48 +556,45 @@ auto EmbeddedRedis::setnx(std::string_view key, std::string_view value) -> Resul
  * @copydoc EmbeddedRedis::incrbyfloat
  */
 auto EmbeddedRedis::incrbyfloat(std::string_view key, double delta) -> Result<double> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
-  if (existing && existing->type != DataType::String) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<double> {
+    auto existing = impl_->get_meta(txn, key);
+    if (existing && existing->type != DataType::String) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  double val = 0.0;
-  if (existing) {
-    std::string raw;
-    if (impl_->db->Get(impl_->read_opts, encode_string_key(key), &raw).ok()) {
-      if (!parse_number_strict(raw, val)) {
-        return std::unexpected(ErrorCode::WrongType);
+    double val = 0.0;
+    if (existing) {
+      std::string raw;
+      if (txn.Get(Impl::snap_opts(txn), encode_string_key(key), &raw).ok()) {
+        if (!parse_number_strict(raw, val)) {
+          return std::unexpected(ErrorCode::WrongType);
+        }
       }
     }
-  }
 
-  val += delta;
-  auto const new_str = [&] {
-    // double を文字列に変換（冗長な桁を削減）
-    auto s = std::format("{}", val);
-    // 小数点を含み末尾が 0 の場合はトリム
-    if (s.find('.') != std::string::npos) {
-      while (s.size() > 1 && s.back() == '0') s.pop_back();
-      if (s.back() == '.') s.pop_back();
-    }
-    return s;
-  }();
+    val += delta;
+    auto const new_str = [&] {
+      // double を文字列に変換（冗長な桁を削減）
+      auto s = std::format("{}", val);
+      // 小数点を含み末尾が 0 の場合はトリム
+      if (s.find('.') != std::string::npos) {
+        while (s.size() > 1 && s.back() == '0') s.pop_back();
+        if (s.back() == '.') s.pop_back();
+      }
+      return s;
+    }();
 
-  rocksdb::WriteBatch batch;
-  MetaValue meta;
-  meta.type    = DataType::String;
-  meta.version = existing ? existing->version : 1;
-  meta.size    = new_str.size();
-  impl_->put_meta(batch, key, meta);
-  batch.Put(encode_string_key(key), new_str);
+    MetaValue meta;
+    meta.type    = DataType::String;
+    meta.version = existing ? existing->version : 1;
+    // Redis 互換: 値を書き換えるだけの操作は TTL を維持する
+    meta.expiration_ms = existing ? existing->expiration_ms : 0;
+    meta.size    = new_str.size();
+    impl_->put_meta(txn, key, meta);
+    std::ignore = txn.Put(encode_string_key(key), new_str);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return val;
+    return val;
+  });
 }
 
 /**
@@ -495,11 +602,9 @@ auto EmbeddedRedis::incrbyfloat(std::string_view key, double delta) -> Result<do
  *
  * @copydoc EmbeddedRedis::getrange
  */
-auto EmbeddedRedis::getrange(std::string_view key, int64_t start, int64_t end) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
+/** @brief getrange の実体（引数を書き換えるため、再試行ごとに新しいコピーで実行する） */
+auto EmbeddedRedis::Impl::getrange(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t end) -> Result<std::string> {
+  auto const meta = get_meta_ro(txn, key);
   if (!meta) {
     return std::string{};
   }
@@ -508,7 +613,7 @@ auto EmbeddedRedis::getrange(std::string_view key, int64_t start, int64_t end) -
   }
 
   std::string raw;
-  if (!impl_->db->Get(impl_->read_opts, encode_string_key(key), &raw).ok()) {
+  if (!txn.Get(snap_opts(txn), encode_string_key(key), &raw).ok()) {
     return std::string{};
   }
 
@@ -523,43 +628,46 @@ auto EmbeddedRedis::getrange(std::string_view key, int64_t start, int64_t end) -
   return raw.substr(static_cast<std::size_t>(start), static_cast<std::size_t>(end - start + 1));
 }
 
+auto EmbeddedRedis::getrange(std::string_view key, int64_t start, int64_t end) -> Result<std::string> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    return impl_->getrange(txn, key, start, end);
+  });
+}
+
 /**
  * @brief 文字列値の指定位置から上書きする
  *
  * @copydoc EmbeddedRedis::setrange
  */
 auto EmbeddedRedis::setrange(std::string_view key, uint64_t offset, std::string_view value) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
-  if (existing && existing->type != DataType::String) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto existing = impl_->get_meta(txn, key);
+    if (existing && existing->type != DataType::String) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  std::string current;
-  if (existing) {
-    impl_->db->Get(impl_->read_opts, encode_string_key(key), &current);
-  }
+    std::string current;
+    if (existing) {
+      std::ignore = txn.Get(Impl::snap_opts(txn), encode_string_key(key), &current);
+    }
 
-  auto const needed = offset + value.size();
-  if (current.size() < needed) {
-    current.resize(needed, '\0');
-  }
-  current.replace(offset, value.size(), value);
+    auto const needed = offset + value.size();
+    if (current.size() < needed) {
+      current.resize(needed, '\0');
+    }
+    current.replace(offset, value.size(), value);
 
-  rocksdb::WriteBatch batch;
-  MetaValue meta;
-  meta.type    = DataType::String;
-  meta.version = existing ? existing->version : 1;
-  meta.size    = current.size();
-  impl_->put_meta(batch, key, meta);
-  batch.Put(encode_string_key(key), rocksdb::Slice(current));
+    MetaValue meta;
+    meta.type    = DataType::String;
+    meta.version = existing ? existing->version : 1;
+    // Redis 互換: 値を書き換えるだけの操作は TTL を維持する
+    meta.expiration_ms = existing ? existing->expiration_ms : 0;
+    meta.size    = current.size();
+    impl_->put_meta(txn, key, meta);
+    std::ignore = txn.Put(encode_string_key(key), rocksdb::Slice(current));
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return static_cast<uint64_t>(current.size());
+    return static_cast<uint64_t>(current.size());
+  });
 }
 
 // ============================================================
@@ -571,11 +679,9 @@ auto EmbeddedRedis::setrange(std::string_view key, uint64_t offset, std::string_
  *
  * @copydoc EmbeddedRedis::hset
  */
-auto EmbeddedRedis::hset(std::string_view key, std::string_view field, std::string_view value) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
+/** @brief hset の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::hset(rocksdb::Transaction& txn, std::string_view key, std::string_view field, std::string_view value) -> Result<bool> {
+  auto existing = get_meta(txn, key);
   if (existing && existing->type != DataType::Hash) {
     return std::unexpected(ErrorCode::WrongType);
   }
@@ -591,19 +697,21 @@ auto EmbeddedRedis::hset(std::string_view key, std::string_view field, std::stri
 
   // フィールドが既存かどうかを事前確認し、新規ならサイズを増やす
   std::string dummy;
-  bool const  is_new = !impl_->db->Get(impl_->read_opts, hk, &dummy).ok();
+  bool const  is_new = !txn.Get(snap_opts(txn), hk, &dummy).ok();
   if (is_new) {
     meta.size++;
   }
 
-  rocksdb::WriteBatch batch;
-  batch.Put(hk, rocksdb::Slice(value.data(), value.size()));
-  impl_->put_meta(batch, key, meta);
+  std::ignore = txn.Put(hk, rocksdb::Slice(value.data(), value.size()));
+  put_meta(txn, key, meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return is_new;
+}
+
+auto EmbeddedRedis::hset(std::string_view key, std::string_view field, std::string_view value) -> Result<bool> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->hset(txn, key, field, value);
+  });
 }
 
 /**
@@ -612,22 +720,21 @@ auto EmbeddedRedis::hset(std::string_view key, std::string_view field, std::stri
  * @copydoc EmbeddedRedis::hget
  */
 auto EmbeddedRedis::hget(std::string_view key, std::string_view field) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  std::string value;
-  if (!impl_->db->Get(impl_->read_opts, encode_hash_key(key, meta->version, field), &value).ok()) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  return value;
+    std::string value;
+    if (!txn.Get(Impl::snap_opts(txn), encode_hash_key(key, meta->version, field), &value).ok()) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    return value;
+  });
 }
 
 /**
@@ -636,36 +743,33 @@ auto EmbeddedRedis::hget(std::string_view key, std::string_view field) -> Result
  * @copydoc EmbeddedRedis::hgetall
  */
 auto EmbeddedRedis::hgetall(std::string_view key) -> Result<std::unordered_map<std::string, std::string>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  auto const pfx = encode_hash_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
-
-  std::unordered_map<std::string, std::string> result;
-  result.reserve(meta->size);
-
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) {
-      break;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::unordered_map<std::string, std::string>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::unordered_map<std::string, std::string>{}; // Redis 互換: 存在しないキーは空
     }
-    auto const field = extract_suffix(std::string_view(k.data(), k.size()), 1, key);
-    result.emplace(std::string(field), it->value().ToString());
-  }
-  return result;
+    if (meta->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+
+    auto const pfx = encode_hash_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
+
+    std::unordered_map<std::string, std::string> result;
+    result.reserve(meta->size);
+
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) {
+        break;
+      }
+      auto const field = extract_suffix(std::string_view(k.data(), k.size()), 1, key);
+      result.emplace(std::string(field), it->value().ToString());
+    }
+    return result;
+  });
 }
 
 /**
@@ -673,11 +777,9 @@ auto EmbeddedRedis::hgetall(std::string_view key) -> Result<std::unordered_map<s
  *
  * @copydoc EmbeddedRedis::hdel
  */
-auto EmbeddedRedis::hdel(std::string_view key, std::string_view field) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
+/** @brief hdel の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::hdel(rocksdb::Transaction& txn, std::string_view key, std::string_view field) -> Result<bool> {
+  auto meta = get_meta(txn, key);
   if (!meta) {
     return false;
   }
@@ -687,23 +789,25 @@ auto EmbeddedRedis::hdel(std::string_view key, std::string_view field) -> Result
 
   auto const hk = encode_hash_key(key, meta->version, field);
   std::string exist;
-  if (!impl_->db->Get(impl_->read_opts, hk, &exist).ok()) {
+  if (!txn.Get(snap_opts(txn), hk, &exist).ok()) {
     return false;
   }
 
-  rocksdb::WriteBatch batch;
-  batch.Delete(hk);
+  std::ignore = txn.Delete(hk);
   meta->size--;
   if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
+    std::ignore = txn.Delete(encode_meta_key(key));
   } else {
-    impl_->put_meta(batch, key, *meta);
+    put_meta(txn, key, *meta);
   }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return true;
+}
+
+auto EmbeddedRedis::hdel(std::string_view key, std::string_view field) -> Result<bool> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->hdel(txn, key, field);
+  });
 }
 
 /**
@@ -712,18 +816,17 @@ auto EmbeddedRedis::hdel(std::string_view key, std::string_view field) -> Result
  * @copydoc EmbeddedRedis::hexists
  */
 auto EmbeddedRedis::hexists(std::string_view key, std::string_view field) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return false;
-  }
-  if (meta->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  std::string v;
-  return impl_->db->Get(impl_->read_opts, encode_hash_key(key, meta->version, field), &v).ok();
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return false;
+    }
+    if (meta->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    std::string v;
+    return txn.Get(Impl::snap_opts(txn), encode_hash_key(key, meta->version, field), &v).ok();
+  });
 }
 
 /**
@@ -732,17 +835,16 @@ auto EmbeddedRedis::hexists(std::string_view key, std::string_view field) -> Res
  * @copydoc EmbeddedRedis::hlen
  */
 auto EmbeddedRedis::hlen(std::string_view key) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  return meta->size;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return 0;
+    }
+    if (meta->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    return meta->size;
+  });
 }
 
 /**
@@ -751,35 +853,32 @@ auto EmbeddedRedis::hlen(std::string_view key) -> Result<uint64_t> {
  * @copydoc EmbeddedRedis::hkeys
  */
 auto EmbeddedRedis::hkeys(std::string_view key) -> Result<std::vector<std::string>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::vector<std::string>{};
-  }
-  if (meta->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  auto const pfx = encode_hash_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
-
-  std::vector<std::string> result;
-  result.reserve(meta->size);
-
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) {
-      break;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::string>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::vector<std::string>{};
     }
-    result.emplace_back(extract_suffix(std::string_view(k.data(), k.size()), 1, key));
-  }
-  return result;
+    if (meta->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+
+    auto const pfx = encode_hash_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
+
+    std::vector<std::string> result;
+    result.reserve(meta->size);
+
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) {
+        break;
+      }
+      result.emplace_back(extract_suffix(std::string_view(k.data(), k.size()), 1, key));
+    }
+    return result;
+  });
 }
 
 /**
@@ -788,35 +887,32 @@ auto EmbeddedRedis::hkeys(std::string_view key) -> Result<std::vector<std::strin
  * @copydoc EmbeddedRedis::hvals
  */
 auto EmbeddedRedis::hvals(std::string_view key) -> Result<std::vector<std::string>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::vector<std::string>{};
-  }
-  if (meta->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  auto const pfx = encode_hash_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
-
-  std::vector<std::string> result;
-  result.reserve(meta->size);
-
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) {
-      break;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::string>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::vector<std::string>{};
     }
-    result.emplace_back(it->value().ToString());
-  }
-  return result;
+    if (meta->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+
+    auto const pfx = encode_hash_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
+
+    std::vector<std::string> result;
+    result.reserve(meta->size);
+
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) {
+        break;
+      }
+      result.emplace_back(it->value().ToString());
+    }
+    return result;
+  });
 }
 
 // ---- New Hash Functions ----
@@ -827,41 +923,36 @@ auto EmbeddedRedis::hvals(std::string_view key) -> Result<std::vector<std::strin
  * @copydoc EmbeddedRedis::hsetnx
  */
 auto EmbeddedRedis::hsetnx(std::string_view key, std::string_view field, std::string_view value) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
-  if (existing && existing->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    auto existing = impl_->get_meta(txn, key);
+    if (existing && existing->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  MetaValue meta;
-  if (existing) {
-    meta = *existing;
-  } else {
-    meta.type = DataType::Hash;
-  }
+    MetaValue meta;
+    if (existing) {
+      meta = *existing;
+    } else {
+      meta.type = DataType::Hash;
+    }
 
-  auto const hk = encode_hash_key(key, meta.version, field);
-  std::string dummy;
-  if (impl_->db->Get(impl_->read_opts, hk, &dummy).ok()) {
-    return false;
-  }
+    auto const hk = encode_hash_key(key, meta.version, field);
+    std::string dummy;
+    if (txn.Get(Impl::snap_opts(txn), hk, &dummy).ok()) {
+      return false;
+    }
 
-  if (!existing) {
-    meta.size = 1;
-  } else {
-    meta.size++;
-  }
+    if (!existing) {
+      meta.size = 1;
+    } else {
+      meta.size++;
+    }
 
-  rocksdb::WriteBatch batch;
-  batch.Put(hk, rocksdb::Slice(value.data(), value.size()));
-  impl_->put_meta(batch, key, meta);
+    std::ignore = txn.Put(hk, rocksdb::Slice(value.data(), value.size()));
+    impl_->put_meta(txn, key, meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return true;
+    return true;
+  });
 }
 
 /**
@@ -870,44 +961,39 @@ auto EmbeddedRedis::hsetnx(std::string_view key, std::string_view field, std::st
  * @copydoc EmbeddedRedis::hincrby
  */
 auto EmbeddedRedis::hincrby(std::string_view key, std::string_view field, int64_t delta) -> Result<int64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
-  if (existing && existing->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  MetaValue meta;
-  if (existing) {
-    meta = *existing;
-  } else {
-    meta.type = DataType::Hash;
-  }
-
-  auto const hk = encode_hash_key(key, meta.version, field);
-  std::string raw;
-  int64_t val = 0;
-  bool const found = impl_->db->Get(impl_->read_opts, hk, &raw).ok();
-  if (found) {
-    if (!parse_number_strict(raw, val)) {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<int64_t> {
+    auto existing = impl_->get_meta(txn, key);
+    if (existing && existing->type != DataType::Hash) {
       return std::unexpected(ErrorCode::WrongType);
     }
-  } else {
-    meta.size++;
-  }
 
-  val += delta;
-  auto const new_str = std::to_string(val);
+    MetaValue meta;
+    if (existing) {
+      meta = *existing;
+    } else {
+      meta.type = DataType::Hash;
+    }
 
-  rocksdb::WriteBatch batch;
-  batch.Put(hk, new_str);
-  impl_->put_meta(batch, key, meta);
+    auto const hk = encode_hash_key(key, meta.version, field);
+    std::string raw;
+    int64_t val = 0;
+    bool const found = txn.Get(Impl::snap_opts(txn), hk, &raw).ok();
+    if (found) {
+      if (!parse_number_strict(raw, val)) {
+        return std::unexpected(ErrorCode::WrongType);
+      }
+    } else {
+      meta.size++;
+    }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return val;
+    val += delta;
+    auto const new_str = std::to_string(val);
+
+    std::ignore = txn.Put(hk, new_str);
+    impl_->put_meta(txn, key, meta);
+
+    return val;
+  });
 }
 
 /**
@@ -916,28 +1002,27 @@ auto EmbeddedRedis::hincrby(std::string_view key, std::string_view field, int64_
  * @copydoc EmbeddedRedis::hmget
  */
 auto EmbeddedRedis::hmget(std::string_view key, std::vector<std::string_view> const& fields) -> Result<std::vector<std::optional<std::string>>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::vector<std::optional<std::string>>(fields.size(), std::nullopt);
-  }
-  if (meta->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  std::vector<std::optional<std::string>> result;
-  result.reserve(fields.size());
-  for (auto const& field : fields) {
-    std::string raw;
-    if (impl_->db->Get(impl_->read_opts, encode_hash_key(key, meta->version, field), &raw).ok()) {
-      result.emplace_back(std::move(raw));
-    } else {
-      result.emplace_back(std::nullopt);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::optional<std::string>>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::vector<std::optional<std::string>>(fields.size(), std::nullopt);
     }
-  }
-  return result;
+    if (meta->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+
+    std::vector<std::optional<std::string>> result;
+    result.reserve(fields.size());
+    for (auto const& field : fields) {
+      std::string raw;
+      if (txn.Get(Impl::snap_opts(txn), encode_hash_key(key, meta->version, field), &raw).ok()) {
+        result.emplace_back(std::move(raw));
+      } else {
+        result.emplace_back(std::nullopt);
+      }
+    }
+    return result;
+  });
 }
 
 /**
@@ -946,21 +1031,20 @@ auto EmbeddedRedis::hmget(std::string_view key, std::vector<std::string_view> co
  * @copydoc EmbeddedRedis::hstrlen
  */
 auto EmbeddedRedis::hstrlen(std::string_view key, std::string_view field) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  std::string raw;
-  if (!impl_->db->Get(impl_->read_opts, encode_hash_key(key, meta->version, field), &raw).ok()) {
-    return 0;
-  }
-  return static_cast<uint64_t>(raw.size());
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return 0;
+    }
+    if (meta->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    std::string raw;
+    if (!txn.Get(Impl::snap_opts(txn), encode_hash_key(key, meta->version, field), &raw).ok()) {
+      return 0;
+    }
+    return static_cast<uint64_t>(raw.size());
+  });
 }
 
 /**
@@ -969,33 +1053,30 @@ auto EmbeddedRedis::hstrlen(std::string_view key, std::string_view field) -> Res
  * @copydoc EmbeddedRedis::hrandfield
  */
 auto EmbeddedRedis::hrandfield(std::string_view key) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::Hash) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  if (meta->size == 0) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::Hash) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    if (meta->size == 0) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  auto const pfx = encode_hash_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
+    auto const pfx = encode_hash_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  // 最初のフィールドを返す（組み込み用途では十分ランダム）
-  it->Seek(pfx_slice);
-  if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  return std::string(extract_suffix(std::string_view(it->key().data(), it->key().size()), 1, key));
+    // 最初のフィールドを返す（組み込み用途では十分ランダム）
+    it->Seek(pfx_slice);
+    if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    return std::string(extract_suffix(std::string_view(it->key().data(), it->key().size()), 1, key));
+  });
 }
 
 // ============================================================
@@ -1024,11 +1105,9 @@ static MetaValue init_list_meta(std::optional<MetaValue> const& existing) {
  *
  * @copydoc EmbeddedRedis::lpush
  */
-auto EmbeddedRedis::lpush(std::string_view key, std::string_view value) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const existing = impl_->get_meta(key);
+/** @brief lpush の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::lpush(rocksdb::Transaction& txn, std::string_view key, std::string_view value) -> Result<uint64_t> {
+  auto const existing = get_meta(txn, key);
   if (existing && existing->type != DataType::List) {
     return std::unexpected(ErrorCode::WrongType);
   }
@@ -1037,14 +1116,16 @@ auto EmbeddedRedis::lpush(std::string_view key, std::string_view value) -> Resul
   meta.head_seq--;
   meta.size++;
 
-  rocksdb::WriteBatch batch;
-  batch.Put(encode_list_key(key, meta.version, meta.head_seq), rocksdb::Slice(value.data(), value.size()));
-  impl_->put_meta(batch, key, meta);
+  std::ignore = txn.Put(encode_list_key(key, meta.version, meta.head_seq), rocksdb::Slice(value.data(), value.size()));
+  put_meta(txn, key, meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return meta.size;
+}
+
+auto EmbeddedRedis::lpush(std::string_view key, std::string_view value) -> Result<uint64_t> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    return impl_->lpush(txn, key, value);
+  });
 }
 
 /**
@@ -1052,27 +1133,27 @@ auto EmbeddedRedis::lpush(std::string_view key, std::string_view value) -> Resul
  *
  * @copydoc EmbeddedRedis::rpush
  */
-auto EmbeddedRedis::rpush(std::string_view key, std::string_view value) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const existing = impl_->get_meta(key);
+/** @brief rpush の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::rpush(rocksdb::Transaction& txn, std::string_view key, std::string_view value) -> Result<uint64_t> {
+  auto const existing = get_meta(txn, key);
   if (existing && existing->type != DataType::List) {
     return std::unexpected(ErrorCode::WrongType);
   }
 
   auto meta = init_list_meta(existing);
 
-  rocksdb::WriteBatch batch;
-  batch.Put(encode_list_key(key, meta.version, meta.tail_seq), rocksdb::Slice(value.data(), value.size()));
+  std::ignore = txn.Put(encode_list_key(key, meta.version, meta.tail_seq), rocksdb::Slice(value.data(), value.size()));
   meta.tail_seq++;
   meta.size++;
-  impl_->put_meta(batch, key, meta);
+  put_meta(txn, key, meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return meta.size;
+}
+
+auto EmbeddedRedis::rpush(std::string_view key, std::string_view value) -> Result<uint64_t> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    return impl_->rpush(txn, key, value);
+  });
 }
 
 /**
@@ -1081,42 +1162,37 @@ auto EmbeddedRedis::rpush(std::string_view key, std::string_view value) -> Resul
  * @copydoc EmbeddedRedis::lpop
  */
 auto EmbeddedRedis::lpop(std::string_view key) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::List) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  if (meta->size == 0) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::List) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    if (meta->size == 0) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  auto const lk = encode_list_key(key, meta->version, meta->head_seq);
-  std::string value;
-  if (!impl_->db->Get(impl_->read_opts, lk, &value).ok()) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+    auto const lk = encode_list_key(key, meta->version, meta->head_seq);
+    std::string value;
+    if (!txn.Get(Impl::snap_opts(txn), lk, &value).ok()) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  rocksdb::WriteBatch batch;
-  batch.Delete(lk);
-  meta->head_seq++;
-  meta->size--;
+    std::ignore = txn.Delete(lk);
+    meta->head_seq++;
+    meta->size--;
 
-  // 空になったらメタごと削除、そうでなければ更新
-  if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
-  } else {
-    impl_->put_meta(batch, key, *meta);
-  }
+    // 空になったらメタごと削除、そうでなければ更新
+    if (meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(key));
+    } else {
+      impl_->put_meta(txn, key, *meta);
+    }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return value;
+    return value;
+  });
 }
 
 /**
@@ -1125,41 +1201,36 @@ auto EmbeddedRedis::lpop(std::string_view key) -> Result<std::string> {
  * @copydoc EmbeddedRedis::rpop
  */
 auto EmbeddedRedis::rpop(std::string_view key) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::List) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  if (meta->size == 0) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::List) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    if (meta->size == 0) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  meta->tail_seq--;
-  auto const lk = encode_list_key(key, meta->version, meta->tail_seq);
-  std::string value;
-  if (!impl_->db->Get(impl_->read_opts, lk, &value).ok()) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+    meta->tail_seq--;
+    auto const lk = encode_list_key(key, meta->version, meta->tail_seq);
+    std::string value;
+    if (!txn.Get(Impl::snap_opts(txn), lk, &value).ok()) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  rocksdb::WriteBatch batch;
-  batch.Delete(lk);
-  meta->size--;
+    std::ignore = txn.Delete(lk);
+    meta->size--;
 
-  if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
-  } else {
-    impl_->put_meta(batch, key, *meta);
-  }
+    if (meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(key));
+    } else {
+      impl_->put_meta(txn, key, *meta);
+    }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return value;
+    return value;
+  });
 }
 
 /**
@@ -1167,11 +1238,9 @@ auto EmbeddedRedis::rpop(std::string_view key) -> Result<std::string> {
  *
  * @copydoc EmbeddedRedis::lrange
  */
-auto EmbeddedRedis::lrange(std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
+/** @brief lrange の実体（引数を書き換えるため、再試行ごとに新しいコピーで実行する） */
+auto EmbeddedRedis::Impl::lrange(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>> {
+  auto const meta = get_meta_ro(txn, key);
   if (!meta) {
     // Redis 互換: 存在しないキーに対しては空リストを返す
     return std::vector<std::string>{};
@@ -1199,23 +1268,20 @@ auto EmbeddedRedis::lrange(std::string_view key, int64_t start, int64_t stop) ->
   if (start > stop) {
     return result;
   }
+  result.reserve(static_cast<std::size_t>(stop - start + 1));
 
-  // 内部シーケンス番号に変換
-  auto const head = static_cast<int64_t>(meta->head_seq);
-  auto const seq_start = static_cast<uint64_t>(head + start);
-  auto const count_needed = static_cast<uint64_t>(stop - start + 1);
-
-  auto const pfx = encode_list_prefix(key, meta->version);
-  auto const seek_key = encode_list_key(key, meta->version, seq_start);
+  // 実在する要素を head から順に数えて位置を決める。
+  // lrem はシーケンス番号を振り直さないため「head_seq + index」の算術は成立せず、
+  // 穴の空いたシーケンス空間では別の要素を指してしまう（lindex/lset と同じ走査方式に揃える）。
+  auto const           pfx = encode_list_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(pfx);
+  auto const           seek_key   = encode_list_key(key, meta->version, meta->head_seq);
+  auto const           seq_offset = suffix_offset(key);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+  std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(snap_iter_opts(txn)));
 
-  auto const seq_offset = suffix_offset(key); // prefix(1) + key + version(8)
-
-  for (it->Seek(seek_key); it->Valid(); it->Next()) {
+  int64_t pos = 0;
+  for (it->Seek(seek_key); it->Valid() && pos <= stop; it->Next()) {
     auto const k = it->key();
     if (!k.starts_with(pfx_slice)) {
       break;
@@ -1227,12 +1293,18 @@ auto EmbeddedRedis::lrange(std::string_view key, int64_t start, int64_t stop) ->
     if (seq >= meta->tail_seq) {
       break;
     }
-    result.emplace_back(it->value().ToString());
-    if (result.size() >= count_needed) {
-      break;
+    if (pos >= start) {
+      result.emplace_back(it->value().ToString());
     }
+    pos++;
   }
   return result;
+}
+
+auto EmbeddedRedis::lrange(std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::string>> {
+    return impl_->lrange(txn, key, start, stop);
+  });
 }
 
 /**
@@ -1240,13 +1312,11 @@ auto EmbeddedRedis::lrange(std::string_view key, int64_t start, int64_t stop) ->
  *
  * @copydoc EmbeddedRedis::lrem
  */
-auto EmbeddedRedis::lrem(std::string_view key, int64_t count, std::string_view value) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
+/** @brief lrem の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::lrem(rocksdb::Transaction& txn, std::string_view key, int64_t count, std::string_view value) -> Result<uint64_t> {
+  auto meta = get_meta(txn, key);
   if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
+    return 0; // Redis 互換: 存在しないキーに対しては 0
   }
   if (meta->type != DataType::List) {
     return std::unexpected(ErrorCode::WrongType);
@@ -1261,9 +1331,7 @@ auto EmbeddedRedis::lrem(std::string_view key, int64_t count, std::string_view v
   rocksdb::Slice const pfx_slice(pfx);
   auto const seq_offset = suffix_offset(key);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+  std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(snap_iter_opts(txn)));
 
   // 全要素を (シーケンス, 値) のリストとして取得
   std::vector<std::pair<uint64_t, std::string>> all;
@@ -1305,23 +1373,21 @@ auto EmbeddedRedis::lrem(std::string_view key, int64_t count, std::string_view v
     return 0;
   }
 
-  rocksdb::WriteBatch batch;
   for (auto const seq : to_delete) {
-    batch.Delete(encode_list_key(key, meta->version, seq));
+    std::ignore = txn.Delete(encode_list_key(key, meta->version, seq));
   }
 
   meta->size -= removed;
   if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
+    std::ignore = txn.Delete(encode_meta_key(key));
   } else {
     // 残存要素から head_seq / tail_seq を再計算
     // （先頭・末尾の要素が削除された場合に対応するため）
-    std::optional<uint64_t> new_head;
-    std::optional<uint64_t> new_tail;
+    std::unordered_set<uint64_t> const deleted_seqs(to_delete.begin(), to_delete.end());
+    std::optional<uint64_t>            new_head;
+    std::optional<uint64_t>            new_tail;
     for (auto const& [seq, v] : all) {
-      // 削除対象かどうかを判定
-      bool const deleted = std::find(to_delete.begin(), to_delete.end(), seq) != to_delete.end();
-      if (!deleted) {
+      if (!deleted_seqs.contains(seq)) {
         if (!new_head) {
           new_head = seq;
         }
@@ -1332,13 +1398,16 @@ auto EmbeddedRedis::lrem(std::string_view key, int64_t count, std::string_view v
       meta->head_seq = *new_head;
       meta->tail_seq = *new_tail + 1;
     }
-    impl_->put_meta(batch, key, *meta);
+    put_meta(txn, key, *meta);
   }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return removed;
+}
+
+auto EmbeddedRedis::lrem(std::string_view key, int64_t count, std::string_view value) -> Result<uint64_t> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    return impl_->lrem(txn, key, count, value);
+  });
 }
 
 /**
@@ -1346,13 +1415,11 @@ auto EmbeddedRedis::lrem(std::string_view key, int64_t count, std::string_view v
  *
  * @copydoc EmbeddedRedis::ltrim
  */
-auto EmbeddedRedis::ltrim(std::string_view key, int64_t start, int64_t stop) -> Result<void> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
+/** @brief ltrim の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::ltrim(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<void> {
+  auto meta = get_meta(txn, key);
   if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
+    return {}; // Redis 互換: 存在しないキーへの LTRIM は成功扱い
   }
   if (meta->type != DataType::List) {
     return std::unexpected(ErrorCode::WrongType);
@@ -1368,35 +1435,64 @@ auto EmbeddedRedis::ltrim(std::string_view key, int64_t start, int64_t stop) -> 
   if (start < 0) start = 0;
   if (stop >= size) stop = size - 1;
 
-  rocksdb::WriteBatch batch;
-
   if (start > stop || size == 0) {
     // 全削除
-    impl_->erase_key_data(batch, key, *meta);
-  } else {
-    auto const head = static_cast<int64_t>(meta->head_seq);
-    auto const new_head = static_cast<uint64_t>(head + start);
-    auto const new_tail = static_cast<uint64_t>(head + stop + 1); // tail_seq は次の位置
-    auto const new_size = static_cast<uint64_t>(stop - start + 1);
-
-    // 範囲外を削除
-    for (uint64_t seq = meta->head_seq; seq < new_head; ++seq) {
-      batch.Delete(encode_list_key(key, meta->version, seq));
-    }
-    for (uint64_t seq = new_tail; seq < meta->tail_seq; ++seq) {
-      batch.Delete(encode_list_key(key, meta->version, seq));
-    }
-
-    meta->head_seq = new_head;
-    meta->tail_seq = new_tail;
-    meta->size     = new_size;
-    impl_->put_meta(batch, key, *meta);
+    erase_key_data(txn, key, *meta);
+    return {};
   }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
+  // lrem が残したシーケンス空間の穴を跨ぐため、実在する要素を走査して位置を数える。
+  // 「head_seq + index」で範囲を決めると穴の分だけ境界がずれ、残すべき要素まで消える。
+  auto const           pfx = encode_list_prefix(key, meta->version);
+  rocksdb::Slice const pfx_slice(pfx);
+  auto const           seek_key   = encode_list_key(key, meta->version, meta->head_seq);
+  auto const           seq_offset = suffix_offset(key);
+
+  std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(snap_iter_opts(txn)));
+
+  std::optional<uint64_t> new_head;
+  std::optional<uint64_t> new_tail;
+  int64_t                 pos = 0;
+  for (it->Seek(seek_key); it->Valid(); it->Next()) {
+    auto const k = it->key();
+    if (!k.starts_with(pfx_slice)) {
+      break;
+    }
+    if (static_cast<std::size_t>(k.size()) < seq_offset + 8) {
+      break;
+    }
+    auto const seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
+    if (seq >= meta->tail_seq) {
+      break;
+    }
+    if (pos < start || pos > stop) {
+      std::ignore = txn.Delete(k);
+    } else {
+      if (!new_head) {
+        new_head = seq;
+      }
+      new_tail = seq;
+    }
+    pos++;
   }
+
+  if (!new_head) {
+    // 残る要素がない（メタの size と実データが食い違っていた場合を含む）
+    erase_key_data(txn, key, *meta);
+    return {};
+  }
+
+  meta->head_seq = *new_head;
+  meta->tail_seq = *new_tail + 1;
+  meta->size     = static_cast<uint64_t>(stop - start + 1);
+  put_meta(txn, key, *meta);
   return {};
+}
+
+auto EmbeddedRedis::ltrim(std::string_view key, int64_t start, int64_t stop) -> Result<void> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<void> {
+    return impl_->ltrim(txn, key, start, stop);
+  });
 }
 
 /**
@@ -1405,17 +1501,16 @@ auto EmbeddedRedis::ltrim(std::string_view key, int64_t start, int64_t stop) -> 
  * @copydoc EmbeddedRedis::llen
  */
 auto EmbeddedRedis::llen(std::string_view key) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::List) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  return meta->size;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return 0;
+    }
+    if (meta->type != DataType::List) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    return meta->size;
+  });
 }
 
 /**
@@ -1423,11 +1518,9 @@ auto EmbeddedRedis::llen(std::string_view key) -> Result<uint64_t> {
  *
  * @copydoc EmbeddedRedis::lindex
  */
-auto EmbeddedRedis::lindex(std::string_view key, int64_t index) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
+/** @brief lindex の実体（引数を書き換えるため、再試行ごとに新しいコピーで実行する） */
+auto EmbeddedRedis::Impl::lindex(rocksdb::Transaction& txn, std::string_view key, int64_t index) -> Result<std::string> {
+  auto const meta = get_meta_ro(txn, key);
   if (!meta) {
     return std::unexpected(ErrorCode::NotFound);
   }
@@ -1449,9 +1542,7 @@ auto EmbeddedRedis::lindex(std::string_view key, int64_t index) -> Result<std::s
   auto const seek_key = encode_list_key(key, meta->version, meta->head_seq);
   auto const seq_offset = suffix_offset(key);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+  std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(snap_iter_opts(txn)));
 
   int64_t pos = 0;
   for (it->Seek(seek_key); it->Valid(); it->Next()) {
@@ -1471,6 +1562,12 @@ auto EmbeddedRedis::lindex(std::string_view key, int64_t index) -> Result<std::s
   return std::unexpected(ErrorCode::NotFound);
 }
 
+auto EmbeddedRedis::lindex(std::string_view key, int64_t index) -> Result<std::string> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    return impl_->lindex(txn, key, index);
+  });
+}
+
 // ---- New List Functions ----
 
 /**
@@ -1478,11 +1575,9 @@ auto EmbeddedRedis::lindex(std::string_view key, int64_t index) -> Result<std::s
  *
  * @copydoc EmbeddedRedis::lset
  */
-auto EmbeddedRedis::lset(std::string_view key, int64_t index, std::string_view value) -> Result<void> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
+/** @brief lset の実体（引数を書き換えるため、再試行ごとに新しいコピーで実行する） */
+auto EmbeddedRedis::Impl::lset(rocksdb::Transaction& txn, std::string_view key, int64_t index, std::string_view value) -> Result<void> {
+  auto meta = get_meta(txn, key);
   if (!meta) {
     return std::unexpected(ErrorCode::NotFound);
   }
@@ -1504,9 +1599,7 @@ auto EmbeddedRedis::lset(std::string_view key, int64_t index, std::string_view v
   auto const seek_key = encode_list_key(key, meta->version, meta->head_seq);
   auto const seq_offset = suffix_offset(key);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+  std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(snap_iter_opts(txn)));
 
   int64_t pos = 0;
   for (it->Seek(seek_key); it->Valid(); it->Next()) {
@@ -1519,16 +1612,18 @@ auto EmbeddedRedis::lset(std::string_view key, int64_t index, std::string_view v
       break;
     }
     if (pos == index) {
-      rocksdb::WriteBatch batch;
-      batch.Put(k, rocksdb::Slice(value.data(), value.size()));
-      if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-        return std::unexpected(ErrorCode::RocksDBError);
-      }
+      std::ignore = txn.Put(k, rocksdb::Slice(value.data(), value.size()));
       return {};
     }
     pos++;
   }
   return std::unexpected(ErrorCode::NotFound);
+}
+
+auto EmbeddedRedis::lset(std::string_view key, int64_t index, std::string_view value) -> Result<void> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<void> {
+    return impl_->lset(txn, key, index, value);
+  });
 }
 
 /**
@@ -1537,42 +1632,39 @@ auto EmbeddedRedis::lset(std::string_view key, int64_t index, std::string_view v
  * @copydoc EmbeddedRedis::lpos
  */
 auto EmbeddedRedis::lpos(std::string_view key, std::string_view element) -> Result<int64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<int64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::List) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+
+    auto const pfx = encode_list_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+    auto const seek_key = encode_list_key(key, meta->version, meta->head_seq);
+    auto const seq_offset = suffix_offset(key);
+
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
+
+    int64_t pos = 0;
+    for (it->Seek(seek_key); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) {
+        break;
+      }
+      auto const seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
+      if (seq >= meta->tail_seq) {
+        break;
+      }
+      if (it->value().ToString() == element) {
+        return pos;
+      }
+      pos++;
+    }
     return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::List) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  auto const pfx = encode_list_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-  auto const seek_key = encode_list_key(key, meta->version, meta->head_seq);
-  auto const seq_offset = suffix_offset(key);
-
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
-
-  int64_t pos = 0;
-  for (it->Seek(seek_key); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) {
-      break;
-    }
-    auto const seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
-    if (seq >= meta->tail_seq) {
-      break;
-    }
-    if (it->value().ToString() == element) {
-      return pos;
-    }
-    pos++;
-  }
-  return std::unexpected(ErrorCode::NotFound);
+  });
 }
 
 /**
@@ -1581,28 +1673,23 @@ auto EmbeddedRedis::lpos(std::string_view key, std::string_view element) -> Resu
  * @copydoc EmbeddedRedis::lpushx
  */
 auto EmbeddedRedis::lpushx(std::string_view key, std::string_view value) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::List) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) {
+      return 0;
+    }
+    if (meta->type != DataType::List) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  meta->head_seq--;
-  meta->size++;
+    meta->head_seq--;
+    meta->size++;
 
-  rocksdb::WriteBatch batch;
-  batch.Put(encode_list_key(key, meta->version, meta->head_seq), rocksdb::Slice(value.data(), value.size()));
-  impl_->put_meta(batch, key, *meta);
+    std::ignore = txn.Put(encode_list_key(key, meta->version, meta->head_seq), rocksdb::Slice(value.data(), value.size()));
+    impl_->put_meta(txn, key, *meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return meta->size;
+    return meta->size;
+  });
 }
 
 /**
@@ -1611,29 +1698,24 @@ auto EmbeddedRedis::lpushx(std::string_view key, std::string_view value) -> Resu
  * @copydoc EmbeddedRedis::rpushx
  */
 auto EmbeddedRedis::rpushx(std::string_view key, std::string_view value) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::List) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) {
+      return 0;
+    }
+    if (meta->type != DataType::List) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  auto const seq = meta->tail_seq;
-  meta->tail_seq++;
-  meta->size++;
+    auto const seq = meta->tail_seq;
+    meta->tail_seq++;
+    meta->size++;
 
-  rocksdb::WriteBatch batch;
-  batch.Put(encode_list_key(key, meta->version, seq), rocksdb::Slice(value.data(), value.size()));
-  impl_->put_meta(batch, key, *meta);
+    std::ignore = txn.Put(encode_list_key(key, meta->version, seq), rocksdb::Slice(value.data(), value.size()));
+    impl_->put_meta(txn, key, *meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return meta->size;
+    return meta->size;
+  });
 }
 
 /**
@@ -1642,74 +1724,61 @@ auto EmbeddedRedis::rpushx(std::string_view key, std::string_view value) -> Resu
  * @copydoc EmbeddedRedis::linsert
  */
 auto EmbeddedRedis::linsert(std::string_view key, InsertPosition pos, std::string_view pivot, std::string_view value) -> Result<uint64_t> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
-  auto meta = impl_->get_meta(key);
-  if (!meta) return std::unexpected(ErrorCode::NotFound);
-  if (meta->type != DataType::List) return std::unexpected(ErrorCode::WrongType);
-  if (meta->size == 0) return std::unexpected(ErrorCode::NotFound);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) return 0; // Redis 互換: 存在しないキーは 0
+    if (meta->type != DataType::List) return std::unexpected(ErrorCode::WrongType);
+    if (meta->size == 0) return 0;
 
-  auto const pfx = encode_list_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-  auto const seq_offset = suffix_offset(key);
+    auto const pfx = encode_list_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+    auto const seq_offset = suffix_offset(key);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  std::vector<uint64_t> seqs;
-  std::vector<std::string> vals;
-  seqs.reserve(meta->size);
-  vals.reserve(meta->size);
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    if (static_cast<std::size_t>(k.size()) < seq_offset + 8) break;
-    auto const seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
-    seqs.push_back(seq);
-    vals.emplace_back(it->value().data(), it->value().size());
-  }
+    std::vector<uint64_t> seqs;
+    std::vector<std::string> vals;
+    seqs.reserve(meta->size);
+    vals.reserve(meta->size);
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      if (static_cast<std::size_t>(k.size()) < seq_offset + 8) break;
+      auto const seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
+      seqs.push_back(seq);
+      vals.emplace_back(it->value().data(), it->value().size());
+    }
 
-  auto const pivot_it = std::find(vals.begin(), vals.end(), pivot);
-  if (pivot_it == vals.end()) return std::unexpected(ErrorCode::NotFound);
+    auto const pivot_it = std::find(vals.begin(), vals.end(), pivot);
+    if (pivot_it == vals.end()) return std::unexpected(ErrorCode::NotFound);
 
-  auto const pivot_idx = static_cast<std::size_t>(std::distance(vals.begin(), pivot_it));
-  auto const insert_idx = (pos == InsertPosition::Before) ? pivot_idx : pivot_idx + 1;
+    auto const pivot_idx = static_cast<std::size_t>(std::distance(vals.begin(), pivot_it));
+    auto const insert_idx = (pos == InsertPosition::Before) ? pivot_idx : pivot_idx + 1;
 
-  vals.insert(vals.begin() + static_cast<ptrdiff_t>(insert_idx), std::string(value));
+    vals.insert(vals.begin() + static_cast<ptrdiff_t>(insert_idx), std::string(value));
 
-  rocksdb::WriteBatch batch;
+    // Bump version to avoid seq collisions and delete old elements by prefix
+    auto const old_version = meta->version;
+    meta->version = meta->version + 1;
+    auto const new_version = meta->version;
 
-  // Bump version to avoid seq collisions and delete old elements by prefix
-  auto const old_version = meta->version;
-  meta->version = meta->version + 1;
-  auto const new_version = meta->version;
+    impl_->delete_by_prefix(txn, encode_list_prefix(key, old_version));
 
-  impl_->delete_by_prefix(batch, encode_list_prefix(key, old_version));
+    // write new elements under new_version starting at a midpoint to allow lpush/rpush
+    auto const base = std::numeric_limits<uint64_t>::max() / 2;
+    for (std::size_t i = 0; i < vals.size(); ++i) {
+      std::ignore = txn.Put(encode_list_key(key, new_version, base + i), vals[i]);
+    }
 
-  // write new elements under new_version starting at a midpoint to allow lpush/rpush
-  auto const base = std::numeric_limits<uint64_t>::max() / 2;
-  for (std::size_t i = 0; i < vals.size(); ++i) {
-    batch.Put(encode_list_key(key, new_version, base + i), vals[i]);
-  }
+    meta->head_seq = base;
+    meta->tail_seq = base + vals.size();
+    meta->size = vals.size();
+    impl_->put_meta(txn, key, *meta);
 
-  meta->head_seq = base;
-  meta->tail_seq = base + vals.size();
-  meta->size = vals.size();
-  impl_->put_meta(batch, key, *meta);
-
-  // CAS protection: ensure meta.version was not changed by concurrent writers
-  auto const current_meta = impl_->get_meta(key);
-  if (!current_meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (current_meta->version != old_version) {
-    return std::unexpected(ErrorCode::Busy);
-  }
-
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return meta->size;
+    // 並行更新の検出はトランザクションが行う。メタキーは get_meta が GetForUpdate で
+    // 読んでいるため、他スレッドが割り込んだ場合はコミットが競合し run_txn が再実行する。
+    return meta->size;
+  });
 }
 
 /**
@@ -1718,125 +1787,107 @@ auto EmbeddedRedis::linsert(std::string_view key, InsertPosition pos, std::strin
  * @copydoc EmbeddedRedis::lmove
  */
 auto EmbeddedRedis::lmove(std::string_view source, std::string_view destination, ListSide from, ListSide to) -> Result<std::string> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
 
-  auto src_meta = impl_->get_meta(source);
-  if (!src_meta) return std::unexpected(ErrorCode::NotFound);
-  if (src_meta->type != DataType::List) return std::unexpected(ErrorCode::WrongType);
-  if (src_meta->size == 0) return std::unexpected(ErrorCode::NotFound);
+    auto src_meta = impl_->get_meta(txn, source);
+    if (!src_meta) return std::unexpected(ErrorCode::NotFound);
+    if (src_meta->type != DataType::List) return std::unexpected(ErrorCode::WrongType);
+    if (src_meta->size == 0) return std::unexpected(ErrorCode::NotFound);
 
-  if (source == destination) {
-    auto const pfx = encode_list_prefix(source, src_meta->version);
-    rocksdb::Slice const pfx_slice(pfx);
-    rocksdb::ReadOptions iter_opts;
-    iter_opts.fill_cache = false;
-    std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    if (source == destination) {
+      auto const pfx = encode_list_prefix(source, src_meta->version);
+      rocksdb::Slice const pfx_slice(pfx);
+      std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-    std::vector<std::string> values;
-    values.reserve(src_meta->size);
-    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-      auto const k = it->key();
-      if (!k.starts_with(pfx_slice)) {
-        break;
+      std::vector<std::string> values;
+      values.reserve(src_meta->size);
+      for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+        auto const k = it->key();
+        if (!k.starts_with(pfx_slice)) {
+          break;
+        }
+        values.emplace_back(it->value().data(), it->value().size());
       }
-      values.emplace_back(it->value().data(), it->value().size());
-    }
-    if (values.empty()) {
-      return std::unexpected(ErrorCode::NotFound);
-    }
+      if (values.empty()) {
+        return std::unexpected(ErrorCode::NotFound);
+      }
 
-    auto const moved = from == ListSide::Left ? values.front() : values.back();
-    if (values.size() == 1 || from == to) {
+      auto const moved = from == ListSide::Left ? values.front() : values.back();
+      if (values.size() == 1 || from == to) {
+        return moved;
+      }
+
+      if (from == ListSide::Left) {
+        std::rotate(values.begin(), values.begin() + 1, values.end());
+      } else {
+        std::rotate(values.rbegin(), values.rbegin() + 1, values.rend());
+      }
+
+      auto const old_version = src_meta->version;
+      src_meta->version = old_version + 1;
+      impl_->delete_by_prefix(txn, encode_list_prefix(source, old_version));
+
+      auto const base = std::numeric_limits<uint64_t>::max() / 2;
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        std::ignore = txn.Put(encode_list_key(source, src_meta->version, base + i), values[i]);
+      }
+      src_meta->head_seq = base;
+      src_meta->tail_seq = base + values.size();
+      impl_->put_meta(txn, source, *src_meta);
+
       return moved;
     }
 
+    auto dst_meta = impl_->get_meta(txn, destination);
+    if (dst_meta && dst_meta->type != DataType::List) return std::unexpected(ErrorCode::WrongType);
+
+    std::string value;
+
+    // pop from source
+    uint64_t popped_seq = 0;
     if (from == ListSide::Left) {
-      std::rotate(values.begin(), values.begin() + 1, values.end());
+      popped_seq = src_meta->head_seq;
+      auto const lk = encode_list_key(source, src_meta->version, popped_seq);
+      std::string tmp;
+      if (!txn.Get(Impl::snap_opts(txn), lk, &tmp).ok()) return std::unexpected(ErrorCode::NotFound);
+      value = std::move(tmp);
+      std::ignore = txn.Delete(lk);
+      src_meta->head_seq++;
     } else {
-      std::rotate(values.rbegin(), values.rbegin() + 1, values.rend());
+      src_meta->tail_seq--;
+      popped_seq = src_meta->tail_seq;
+      auto const lk = encode_list_key(source, src_meta->version, popped_seq);
+      std::string tmp;
+      if (!txn.Get(Impl::snap_opts(txn), lk, &tmp).ok()) return std::unexpected(ErrorCode::NotFound);
+      value = std::move(tmp);
+      std::ignore = txn.Delete(lk);
     }
+    src_meta->size--;
 
-    rocksdb::WriteBatch batch;
-    auto const old_version = src_meta->version;
-    src_meta->version = old_version + 1;
-    impl_->delete_by_prefix(batch, encode_list_prefix(source, old_version));
-
-    auto const base = std::numeric_limits<uint64_t>::max() / 2;
-    for (std::size_t i = 0; i < values.size(); ++i) {
-      batch.Put(encode_list_key(source, src_meta->version, base + i), values[i]);
-    }
-    src_meta->head_seq = base;
-    src_meta->tail_seq = base + values.size();
-    impl_->put_meta(batch, source, *src_meta);
-
-    if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-      return std::unexpected(ErrorCode::RocksDBError);
-    }
-    return moved;
-  }
-
-  auto dst_meta = impl_->get_meta(destination);
-  if (dst_meta && dst_meta->type != DataType::List) return std::unexpected(ErrorCode::WrongType);
-
-  std::string value;
-
-  rocksdb::WriteBatch batch;
-
-  // pop from source
-  uint64_t popped_seq = 0;
-  if (from == ListSide::Left) {
-    popped_seq = src_meta->head_seq;
-    auto const lk = encode_list_key(source, src_meta->version, popped_seq);
-    std::string tmp;
-    if (!impl_->db->Get(impl_->read_opts, lk, &tmp).ok()) return std::unexpected(ErrorCode::NotFound);
-    value = std::move(tmp);
-    batch.Delete(lk);
-    src_meta->head_seq++;
-  } else {
-    src_meta->tail_seq--;
-    popped_seq = src_meta->tail_seq;
-    auto const lk = encode_list_key(source, src_meta->version, popped_seq);
-    std::string tmp;
-    if (!impl_->db->Get(impl_->read_opts, lk, &tmp).ok()) return std::unexpected(ErrorCode::NotFound);
-    value = std::move(tmp);
-    batch.Delete(lk);
-  }
-  src_meta->size--;
-
-  if (src_meta->size == 0) {
-    batch.Delete(encode_meta_key(source));
-  } else {
-    impl_->put_meta(batch, source, *src_meta);
-  }
-
-  // push to destination
-  if (!dst_meta) {
-    dst_meta = MetaValue{};
-    dst_meta->type = DataType::List;
-  }
-  if (to == ListSide::Left) {
-    if (dst_meta->size == 0) {
-      dst_meta->head_seq = 0;
-      dst_meta->tail_seq = 1;
-      batch.Put(encode_list_key(destination, dst_meta->version, 0), value);
+    if (src_meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(source));
     } else {
+      impl_->put_meta(txn, source, *src_meta);
+    }
+
+    // push to destination
+    // 新規リストは init_list_meta と同じ中央値から開始する。0 から始めると
+    // 直後の lpush で head_seq が 0 を下回って uint64_t が一周し、キー順が崩れる。
+    if (!dst_meta) {
+      dst_meta = init_list_meta(std::nullopt);
+    }
+    if (to == ListSide::Left) {
       dst_meta->head_seq--;
-      batch.Put(encode_list_key(destination, dst_meta->version, dst_meta->head_seq), value);
+      std::ignore = txn.Put(encode_list_key(destination, dst_meta->version, dst_meta->head_seq), value);
+    } else {
+      std::ignore = txn.Put(encode_list_key(destination, dst_meta->version, dst_meta->tail_seq), value);
+      dst_meta->tail_seq++;
     }
-  } else {
-    if (dst_meta->size == 0) {
-      dst_meta->head_seq = 0;
-    }
-    batch.Put(encode_list_key(destination, dst_meta->version, dst_meta->tail_seq), value);
-    dst_meta->tail_seq++;
-  }
-  dst_meta->size++;
-  impl_->put_meta(batch, destination, *dst_meta);
+    dst_meta->size++;
+    impl_->put_meta(txn, destination, *dst_meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return value;
+    return value;
+  });
 }
 
 /**
@@ -1857,11 +1908,9 @@ auto EmbeddedRedis::rpoplpush(std::string_view source, std::string_view destinat
  *
  * @copydoc EmbeddedRedis::sadd
  */
-auto EmbeddedRedis::sadd(std::string_view key, std::string_view member) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const existing = impl_->get_meta(key);
+/** @brief sadd の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::sadd(rocksdb::Transaction& txn, std::string_view key, std::string_view member) -> Result<bool> {
+  auto const existing = get_meta(txn, key);
   if (existing && existing->type != DataType::Set) {
     return std::unexpected(ErrorCode::WrongType);
   }
@@ -1877,19 +1926,21 @@ auto EmbeddedRedis::sadd(std::string_view key, std::string_view member) -> Resul
 
   // メンバーの重複チェック
   std::string dummy;
-  bool const  is_new = !impl_->db->Get(impl_->read_opts, sk, &dummy).ok();
+  bool const  is_new = !txn.Get(snap_opts(txn), sk, &dummy).ok();
   if (is_new) {
     meta.size++;
   }
 
-  rocksdb::WriteBatch batch;
-  batch.Put(sk, rocksdb::Slice());
-  impl_->put_meta(batch, key, meta);
+  std::ignore = txn.Put(sk, rocksdb::Slice());
+  put_meta(txn, key, meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return is_new;
+}
+
+auto EmbeddedRedis::sadd(std::string_view key, std::string_view member) -> Result<bool> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->sadd(txn, key, member);
+  });
 }
 
 /**
@@ -1898,35 +1949,32 @@ auto EmbeddedRedis::sadd(std::string_view key, std::string_view member) -> Resul
  * @copydoc EmbeddedRedis::smembers
  */
 auto EmbeddedRedis::smembers(std::string_view key) -> Result<std::vector<std::string>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::Set) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  auto const pfx = encode_set_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
-
-  std::vector<std::string> result;
-  result.reserve(meta->size);
-
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) {
-      break;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::string>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::vector<std::string>{}; // Redis 互換: 存在しないキーは空
     }
-    result.emplace_back(extract_suffix(std::string_view(k.data(), k.size()), 1, key));
-  }
-  return result;
+    if (meta->type != DataType::Set) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+
+    auto const pfx = encode_set_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
+
+    std::vector<std::string> result;
+    result.reserve(meta->size);
+
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) {
+        break;
+      }
+      result.emplace_back(extract_suffix(std::string_view(k.data(), k.size()), 1, key));
+    }
+    return result;
+  });
 }
 
 /**
@@ -1934,13 +1982,11 @@ auto EmbeddedRedis::smembers(std::string_view key) -> Result<std::vector<std::st
  *
  * @copydoc EmbeddedRedis::srem
  */
-auto EmbeddedRedis::srem(std::string_view key, std::string_view member) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
+/** @brief srem の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::srem(rocksdb::Transaction& txn, std::string_view key, std::string_view member) -> Result<bool> {
+  auto meta = get_meta(txn, key);
   if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
+    return false; // Redis 互換: 存在しないキーは削除なし
   }
   if (meta->type != DataType::Set) {
     return std::unexpected(ErrorCode::WrongType);
@@ -1950,24 +1996,26 @@ auto EmbeddedRedis::srem(std::string_view key, std::string_view member) -> Resul
 
   // メンバーの存在確認
   std::string dummy;
-  if (!impl_->db->Get(impl_->read_opts, sk, &dummy).ok()) {
+  if (!txn.Get(snap_opts(txn), sk, &dummy).ok()) {
     return false;
   }
 
-  rocksdb::WriteBatch batch;
-  batch.Delete(sk);
+  std::ignore = txn.Delete(sk);
 
   meta->size--;
   if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
+    std::ignore = txn.Delete(encode_meta_key(key));
   } else {
-    impl_->put_meta(batch, key, *meta);
+    put_meta(txn, key, *meta);
   }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return true;
+}
+
+auto EmbeddedRedis::srem(std::string_view key, std::string_view member) -> Result<bool> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->srem(txn, key, member);
+  });
 }
 
 /**
@@ -1976,17 +2024,16 @@ auto EmbeddedRedis::srem(std::string_view key, std::string_view member) -> Resul
  * @copydoc EmbeddedRedis::scard
  */
 auto EmbeddedRedis::scard(std::string_view key) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::Set) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  return meta->size;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return 0;
+    }
+    if (meta->type != DataType::Set) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    return meta->size;
+  });
 }
 
 /**
@@ -1995,18 +2042,17 @@ auto EmbeddedRedis::scard(std::string_view key) -> Result<uint64_t> {
  * @copydoc EmbeddedRedis::sismember
  */
 auto EmbeddedRedis::sismember(std::string_view key, std::string_view member) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return false;
-  }
-  if (meta->type != DataType::Set) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  std::string v;
-  return impl_->db->Get(impl_->read_opts, encode_set_key(key, meta->version, member), &v).ok();
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return false;
+    }
+    if (meta->type != DataType::Set) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    std::string v;
+    return txn.Get(Impl::snap_opts(txn), encode_set_key(key, meta->version, member), &v).ok();
+  });
 }
 
 /**
@@ -2015,48 +2061,41 @@ auto EmbeddedRedis::sismember(std::string_view key, std::string_view member) -> 
  * @copydoc EmbeddedRedis::spop
  */
 auto EmbeddedRedis::spop(std::string_view key) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::Set) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  if (meta->size == 0) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::Set) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    if (meta->size == 0) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  auto const pfx = encode_set_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
+    auto const pfx = encode_set_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  it->Seek(pfx_slice);
-  if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+    it->Seek(pfx_slice);
+    if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  auto const member_key = it->key();
-  auto const member = extract_suffix(std::string_view(member_key.data(), member_key.size()), 1, key);
+    auto const member_key = it->key();
+    auto const member = extract_suffix(std::string_view(member_key.data(), member_key.size()), 1, key);
 
-  rocksdb::WriteBatch batch;
-  batch.Delete(member_key);
-  meta->size--;
-  if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
-  } else {
-    impl_->put_meta(batch, key, *meta);
-  }
+    std::ignore = txn.Delete(member_key);
+    meta->size--;
+    if (meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(key));
+    } else {
+      impl_->put_meta(txn, key, *meta);
+    }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return std::string(member);
+    return std::string(member);
+  });
 }
 
 /**
@@ -2065,32 +2104,29 @@ auto EmbeddedRedis::spop(std::string_view key) -> Result<std::string> {
  * @copydoc EmbeddedRedis::srandmember
  */
 auto EmbeddedRedis::srandmember(std::string_view key) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::Set) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  if (meta->size == 0) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::Set) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    if (meta->size == 0) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  auto const pfx = encode_set_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
+    auto const pfx = encode_set_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  it->Seek(pfx_slice);
-  if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  return std::string(extract_suffix(std::string_view(it->key().data(), it->key().size()), 1, key));
+    it->Seek(pfx_slice);
+    if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    return std::string(extract_suffix(std::string_view(it->key().data(), it->key().size()), 1, key));
+  });
 }
 
 /**
@@ -2099,45 +2135,42 @@ auto EmbeddedRedis::srandmember(std::string_view key) -> Result<std::string> {
  * @copydoc EmbeddedRedis::smove
  */
 auto EmbeddedRedis::smove(std::string_view source, std::string_view destination, std::string_view member) -> Result<bool> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
 
-  auto src_meta = impl_->get_meta(source);
-  if (!src_meta) return false;
-  if (src_meta->type != DataType::Set) return std::unexpected(ErrorCode::WrongType);
+    auto src_meta = impl_->get_meta(txn, source);
+    if (!src_meta) return false;
+    if (src_meta->type != DataType::Set) return std::unexpected(ErrorCode::WrongType);
 
-  auto const src_key = encode_set_key(source, src_meta->version, member);
-  std::string dummy;
-  if (!impl_->db->Get(impl_->read_opts, src_key, &dummy).ok()) return false;
+    auto const src_key = encode_set_key(source, src_meta->version, member);
+    std::string dummy;
+    if (!txn.Get(Impl::snap_opts(txn), src_key, &dummy).ok()) return false;
 
-  auto dst_meta = impl_->get_meta(destination);
-  if (dst_meta && dst_meta->type != DataType::Set) return std::unexpected(ErrorCode::WrongType);
+    auto dst_meta = impl_->get_meta(txn, destination);
+    if (dst_meta && dst_meta->type != DataType::Set) return std::unexpected(ErrorCode::WrongType);
 
-  rocksdb::WriteBatch batch;
-  batch.Delete(src_key);
-  src_meta->size--;
-  if (src_meta->size == 0) {
-    batch.Delete(encode_meta_key(source));
-  } else {
-    impl_->put_meta(batch, source, *src_meta);
-  }
+    std::ignore = txn.Delete(src_key);
+    src_meta->size--;
+    if (src_meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(source));
+    } else {
+      impl_->put_meta(txn, source, *src_meta);
+    }
 
-  if (!dst_meta) {
-    dst_meta = MetaValue{};
-    dst_meta->type = DataType::Set;
-  }
-  auto const dst_key = encode_set_key(destination, dst_meta->version, member);
-  std::string dst_dummy;
-  bool const is_new_dst = !impl_->db->Get(impl_->read_opts, dst_key, &dst_dummy).ok();
-  if (is_new_dst) {
-    dst_meta->size++;
-  }
-  batch.Put(dst_key, rocksdb::Slice());
-  impl_->put_meta(batch, destination, *dst_meta);
+    if (!dst_meta) {
+      dst_meta = MetaValue{};
+      dst_meta->type = DataType::Set;
+    }
+    auto const dst_key = encode_set_key(destination, dst_meta->version, member);
+    std::string dst_dummy;
+    bool const is_new_dst = !txn.Get(Impl::snap_opts(txn), dst_key, &dst_dummy).ok();
+    if (is_new_dst) {
+      dst_meta->size++;
+    }
+    std::ignore = txn.Put(dst_key, rocksdb::Slice());
+    impl_->put_meta(txn, destination, *dst_meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return true;
+    return true;
+  });
 }
 
 // ============================================================
@@ -2149,11 +2182,9 @@ auto EmbeddedRedis::smove(std::string_view source, std::string_view destination,
  *
  * @copydoc EmbeddedRedis::zadd
  */
-auto EmbeddedRedis::zadd(std::string_view key, double score, std::string_view member) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const existing = impl_->get_meta(key);
+/** @brief zadd の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::zadd(rocksdb::Transaction& txn, std::string_view key, double score, std::string_view member) -> Result<bool> {
+  auto const existing = get_meta(txn, key);
   if (existing && existing->type != DataType::ZSet) {
     return std::unexpected(ErrorCode::WrongType);
   }
@@ -2169,13 +2200,11 @@ auto EmbeddedRedis::zadd(std::string_view key, double score, std::string_view me
 
   // 既存スコアがあれば、新しいスコアキーと衝突しないよう古いスコアキーを削除する
   std::string old_score_raw;
-  bool const  is_new = !impl_->db->Get(impl_->read_opts, mk, &old_score_raw).ok();
-
-  rocksdb::WriteBatch batch;
+  bool const  is_new = !txn.Get(snap_opts(txn), mk, &old_score_raw).ok();
 
   if (!is_new && old_score_raw.size() == 8) {
     auto const old_score = decode_score(reinterpret_cast<uint8_t const*>(old_score_raw.data()));
-    batch.Delete(encode_zset_score_key(key, meta.version, old_score, member));
+    std::ignore = txn.Delete(encode_zset_score_key(key, meta.version, old_score, member));
   }
   if (is_new) {
     meta.size++;
@@ -2183,16 +2212,19 @@ auto EmbeddedRedis::zadd(std::string_view key, double score, std::string_view me
 
   // member key → score(8byte encoded)
   auto const sb = encode_score(score);
-  batch.Put(mk, rocksdb::Slice(reinterpret_cast<char const*>(sb.data()), 8));
+  std::ignore = txn.Put(mk, rocksdb::Slice(reinterpret_cast<char const*>(sb.data()), 8));
 
   // score key → empty
-  batch.Put(encode_zset_score_key(key, meta.version, score, member), rocksdb::Slice());
-  impl_->put_meta(batch, key, meta);
+  std::ignore = txn.Put(encode_zset_score_key(key, meta.version, score, member), rocksdb::Slice());
+  put_meta(txn, key, meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return is_new;
+}
+
+auto EmbeddedRedis::zadd(std::string_view key, double score, std::string_view member) -> Result<bool> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->zadd(txn, key, score, member);
+  });
 }
 
 /**
@@ -2201,43 +2233,40 @@ auto EmbeddedRedis::zadd(std::string_view key, double score, std::string_view me
  * @copydoc EmbeddedRedis::zrangebyscore
  */
 auto EmbeddedRedis::zrangebyscore(std::string_view key, double min_score, double max_score) -> Result<std::vector<std::string>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  auto const range_pfx  = encode_zset_score_range_prefix(key, meta->version);
-  auto const seek_key   = encode_zset_score_seek_key(key, meta->version, min_score);
-  rocksdb::Slice const pfx_slice(range_pfx);
-
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
-
-  std::vector<std::string> result;
-  auto const               score_offset = suffix_offset(key); // prefix(1) + key + version(8)
-
-  for (it->Seek(seek_key); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) {
-      break;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::string>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::vector<std::string>{}; // Redis 互換: 存在しないキーは空
     }
-    if (static_cast<std::size_t>(k.size()) < score_offset + 8) {
-      break;
+    if (meta->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
     }
-    auto const sc = decode_score(reinterpret_cast<uint8_t const*>(k.data() + score_offset));
-    if (sc > max_score) {
-      break;
+
+    auto const range_pfx  = encode_zset_score_range_prefix(key, meta->version);
+    auto const seek_key   = encode_zset_score_seek_key(key, meta->version, min_score);
+    rocksdb::Slice const pfx_slice(range_pfx);
+
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
+
+    std::vector<std::string> result;
+    auto const               score_offset = suffix_offset(key); // prefix(1) + key + version(8)
+
+    for (it->Seek(seek_key); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) {
+        break;
+      }
+      if (static_cast<std::size_t>(k.size()) < score_offset + 8) {
+        break;
+      }
+      auto const sc = decode_score(reinterpret_cast<uint8_t const*>(k.data() + score_offset));
+      if (sc > max_score) {
+        break;
+      }
+      result.emplace_back(k.data() + score_offset + 8, k.size() - score_offset - 8);
     }
-    result.emplace_back(k.data() + score_offset + 8, k.size() - score_offset - 8);
-  }
-  return result;
+    return result;
+  });
 }
 
 /**
@@ -2245,11 +2274,9 @@ auto EmbeddedRedis::zrangebyscore(std::string_view key, double min_score, double
  *
  * @copydoc EmbeddedRedis::zrem
  */
-auto EmbeddedRedis::zrem(std::string_view key, std::string_view member) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
+/** @brief zrem の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::zrem(rocksdb::Transaction& txn, std::string_view key, std::string_view member) -> Result<bool> {
+  auto meta = get_meta(txn, key);
   if (!meta) {
     return false;
   }
@@ -2259,7 +2286,7 @@ auto EmbeddedRedis::zrem(std::string_view key, std::string_view member) -> Resul
 
   auto const mk = encode_zset_member_key(key, meta->version, member);
   std::string score_raw;
-  if (!impl_->db->Get(impl_->read_opts, mk, &score_raw).ok()) {
+  if (!txn.Get(snap_opts(txn), mk, &score_raw).ok()) {
     return false;
   }
   if (score_raw.size() != 8) {
@@ -2268,20 +2295,22 @@ auto EmbeddedRedis::zrem(std::string_view key, std::string_view member) -> Resul
 
   auto const old_score = decode_score(reinterpret_cast<uint8_t const*>(score_raw.data()));
 
-  rocksdb::WriteBatch batch;
-  batch.Delete(mk);
-  batch.Delete(encode_zset_score_key(key, meta->version, old_score, member));
+  std::ignore = txn.Delete(mk);
+  std::ignore = txn.Delete(encode_zset_score_key(key, meta->version, old_score, member));
   meta->size--;
   if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
+    std::ignore = txn.Delete(encode_meta_key(key));
   } else {
-    impl_->put_meta(batch, key, *meta);
+    put_meta(txn, key, *meta);
   }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return true;
+}
+
+auto EmbeddedRedis::zrem(std::string_view key, std::string_view member) -> Result<bool> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->zrem(txn, key, member);
+  });
 }
 
 /**
@@ -2290,17 +2319,16 @@ auto EmbeddedRedis::zrem(std::string_view key, std::string_view member) -> Resul
  * @copydoc EmbeddedRedis::zcard
  */
 auto EmbeddedRedis::zcard(std::string_view key) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  return meta->size;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return 0;
+    }
+    if (meta->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    return meta->size;
+  });
 }
 
 /**
@@ -2309,43 +2337,40 @@ auto EmbeddedRedis::zcard(std::string_view key) -> Result<uint64_t> {
  * @copydoc EmbeddedRedis::zcount
  */
 auto EmbeddedRedis::zcount(std::string_view key, double min_score, double max_score) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
-  auto const seek_key  = encode_zset_score_seek_key(key, meta->version, min_score);
-  rocksdb::Slice const pfx_slice(range_pfx);
-
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
-
-  uint64_t count = 0;
-  auto const score_offset = suffix_offset(key);
-
-  for (it->Seek(seek_key); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) {
-      break;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return 0;
     }
-    if (static_cast<std::size_t>(k.size()) < score_offset + 8) {
-      break;
+    if (meta->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
     }
-    auto const sc = decode_score(reinterpret_cast<uint8_t const*>(k.data() + score_offset));
-    if (sc > max_score) {
-      break;
+
+    auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
+    auto const seek_key  = encode_zset_score_seek_key(key, meta->version, min_score);
+    rocksdb::Slice const pfx_slice(range_pfx);
+
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
+
+    uint64_t count = 0;
+    auto const score_offset = suffix_offset(key);
+
+    for (it->Seek(seek_key); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) {
+        break;
+      }
+      if (static_cast<std::size_t>(k.size()) < score_offset + 8) {
+        break;
+      }
+      auto const sc = decode_score(reinterpret_cast<uint8_t const*>(k.data() + score_offset));
+      if (sc > max_score) {
+        break;
+      }
+      count++;
     }
-    count++;
-  }
-  return count;
+    return count;
+  });
 }
 
 /**
@@ -2354,25 +2379,24 @@ auto EmbeddedRedis::zcount(std::string_view key, double min_score, double max_sc
  * @copydoc EmbeddedRedis::zscore
  */
 auto EmbeddedRedis::zscore(std::string_view key, std::string_view member) -> Result<double> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<double> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  std::string score_raw;
-  if (!impl_->db->Get(impl_->read_opts, encode_zset_member_key(key, meta->version, member), &score_raw).ok()) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (score_raw.size() != 8) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  return decode_score(reinterpret_cast<uint8_t const*>(score_raw.data()));
+    std::string score_raw;
+    if (!txn.Get(Impl::snap_opts(txn), encode_zset_member_key(key, meta->version, member), &score_raw).ok()) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (score_raw.size() != 8) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    return decode_score(reinterpret_cast<uint8_t const*>(score_raw.data()));
+  });
 }
 
 /**
@@ -2381,42 +2405,39 @@ auto EmbeddedRedis::zscore(std::string_view key, std::string_view member) -> Res
  * @copydoc EmbeddedRedis::zrank
  */
 auto EmbeddedRedis::zrank(std::string_view key, std::string_view member) -> Result<int64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<int64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+
+    auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(range_pfx);
+
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
+
+    auto const score_offset = suffix_offset(key);
+    int64_t rank = 0;
+
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) {
+        break;
+      }
+      if (static_cast<std::size_t>(k.size()) < score_offset + 8) {
+        break;
+      }
+      auto const m = std::string_view(k.data() + score_offset + 8, k.size() - score_offset - 8);
+      if (m == member) {
+        return rank;
+      }
+      rank++;
+    }
     return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(range_pfx);
-
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
-
-  auto const score_offset = suffix_offset(key);
-  int64_t rank = 0;
-
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) {
-      break;
-    }
-    if (static_cast<std::size_t>(k.size()) < score_offset + 8) {
-      break;
-    }
-    auto const m = std::string_view(k.data() + score_offset + 8, k.size() - score_offset - 8);
-    if (m == member) {
-      return rank;
-    }
-    rank++;
-  }
-  return std::unexpected(ErrorCode::NotFound);
+  });
 }
 
 /**
@@ -2424,11 +2445,9 @@ auto EmbeddedRedis::zrank(std::string_view key, std::string_view member) -> Resu
  *
  * @copydoc EmbeddedRedis::zrange
  */
-auto EmbeddedRedis::zrange(std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
+/** @brief zrange の実体（引数を書き換えるため、再試行ごとに新しいコピーで実行する） */
+auto EmbeddedRedis::Impl::zrange(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>> {
+  auto const meta = get_meta_ro(txn, key);
   if (!meta) {
     return std::vector<std::string>{};
   }
@@ -2453,9 +2472,7 @@ auto EmbeddedRedis::zrange(std::string_view key, int64_t start, int64_t stop) ->
   auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
   rocksdb::Slice const pfx_slice(range_pfx);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+  std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(snap_iter_opts(txn)));
 
   std::vector<std::string> result;
   result.reserve(static_cast<std::size_t>(stop - start + 1));
@@ -2482,6 +2499,12 @@ auto EmbeddedRedis::zrange(std::string_view key, int64_t start, int64_t stop) ->
   return result;
 }
 
+auto EmbeddedRedis::zrange(std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::string>> {
+    return impl_->zrange(txn, key, start, stop);
+  });
+}
+
 // ---- New ZSet Functions ----
 
 /**
@@ -2490,49 +2513,44 @@ auto EmbeddedRedis::zrange(std::string_view key, int64_t start, int64_t stop) ->
  * @copydoc EmbeddedRedis::zincrby
  */
 auto EmbeddedRedis::zincrby(std::string_view key, std::string_view member, double delta) -> Result<double> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto existing = impl_->get_meta(key);
-  if (existing && existing->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  MetaValue meta;
-  if (existing) {
-    meta = *existing;
-  } else {
-    meta.type = DataType::ZSet;
-  }
-
-  auto const mk = encode_zset_member_key(key, meta.version, member);
-  std::string old_raw;
-  bool const found = impl_->db->Get(impl_->read_opts, mk, &old_raw).ok();
-
-  double new_score = delta;
-  if (found) {
-    if (old_raw.size() == 8) {
-      new_score = decode_score(reinterpret_cast<uint8_t const*>(old_raw.data())) + delta;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<double> {
+    auto existing = impl_->get_meta(txn, key);
+    if (existing && existing->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
     }
-  }
-  if (!found) {
-    meta.size++;
-  }
 
-  rocksdb::WriteBatch batch;
-  if (found && old_raw.size() == 8) {
-    auto const old_score = decode_score(reinterpret_cast<uint8_t const*>(old_raw.data()));
-    batch.Delete(encode_zset_score_key(key, meta.version, old_score, member));
-  }
-  auto const sb = encode_score(new_score);
-  batch.Put(mk, rocksdb::Slice(reinterpret_cast<char const*>(sb.data()), 8));
-  batch.Put(encode_zset_score_key(key, meta.version, new_score, member), rocksdb::Slice());
-  impl_->put_meta(batch, key, meta);
+    MetaValue meta;
+    if (existing) {
+      meta = *existing;
+    } else {
+      meta.type = DataType::ZSet;
+    }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return new_score;
+    auto const mk = encode_zset_member_key(key, meta.version, member);
+    std::string old_raw;
+    bool const found = txn.Get(Impl::snap_opts(txn), mk, &old_raw).ok();
+
+    double new_score = delta;
+    if (found) {
+      if (old_raw.size() == 8) {
+        new_score = decode_score(reinterpret_cast<uint8_t const*>(old_raw.data())) + delta;
+      }
+    }
+    if (!found) {
+      meta.size++;
+    }
+
+    if (found && old_raw.size() == 8) {
+      auto const old_score = decode_score(reinterpret_cast<uint8_t const*>(old_raw.data()));
+      std::ignore = txn.Delete(encode_zset_score_key(key, meta.version, old_score, member));
+    }
+    auto const sb = encode_score(new_score);
+    std::ignore = txn.Put(mk, rocksdb::Slice(reinterpret_cast<char const*>(sb.data()), 8));
+    std::ignore = txn.Put(encode_zset_score_key(key, meta.version, new_score, member), rocksdb::Slice());
+    impl_->put_meta(txn, key, meta);
+
+    return new_score;
+  });
 }
 
 /**
@@ -2541,39 +2559,36 @@ auto EmbeddedRedis::zincrby(std::string_view key, std::string_view member, doubl
  * @copydoc EmbeddedRedis::zrevrank
  */
 auto EmbeddedRedis::zrevrank(std::string_view key, std::string_view member) -> Result<int64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<int64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(range_pfx);
+    auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(range_pfx);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  auto const score_offset = suffix_offset(key);
-  int64_t total = 0;
-  int64_t target_rank = -1;
+    auto const score_offset = suffix_offset(key);
+    int64_t total = 0;
+    int64_t target_rank = -1;
 
-  // First pass: count total + find target
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    if (static_cast<std::size_t>(k.size()) < score_offset + 8) break;
-    auto const m = std::string_view(k.data() + score_offset + 8, k.size() - score_offset - 8);
-    if (m == member) target_rank = total;
-    total++;
-  }
-  if (target_rank < 0) return std::unexpected(ErrorCode::NotFound);
-  return total - 1 - target_rank;
+    // First pass: count total + find target
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      if (static_cast<std::size_t>(k.size()) < score_offset + 8) break;
+      auto const m = std::string_view(k.data() + score_offset + 8, k.size() - score_offset - 8);
+      if (m == member) target_rank = total;
+      total++;
+    }
+    if (target_rank < 0) return std::unexpected(ErrorCode::NotFound);
+    return total - 1 - target_rank;
+  });
 }
 
 /**
@@ -2581,11 +2596,9 @@ auto EmbeddedRedis::zrevrank(std::string_view key, std::string_view member) -> R
  *
  * @copydoc EmbeddedRedis::zrevrange
  */
-auto EmbeddedRedis::zrevrange(std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
+/** @brief zrevrange の実体（引数を書き換えるため、再試行ごとに新しいコピーで実行する） */
+auto EmbeddedRedis::Impl::zrevrange(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>> {
+  auto const meta = get_meta_ro(txn, key);
   if (!meta) {
     return std::vector<std::string>{};
   }
@@ -2593,30 +2606,58 @@ auto EmbeddedRedis::zrevrange(std::string_view key, int64_t start, int64_t stop)
     return std::unexpected(ErrorCode::WrongType);
   }
 
-  // Get all members first, then reverse slice
-  auto all = zrange(key, 0, -1);
-  if (!all) return all;
-  auto const size = static_cast<int64_t>(all->size());
-  if (size == 0) return std::vector<std::string>{};
+  auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
+  rocksdb::Slice const pfx_slice(range_pfx);
+  auto const           score_offset = suffix_offset(key);
 
+  std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(snap_iter_opts(txn)));
+
+  // 昇順に全メンバーを集めてから反転スライスする
+  std::vector<std::string> all;
+  all.reserve(meta->size);
+  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+    auto const k = it->key();
+    if (!k.starts_with(pfx_slice)) {
+      break;
+    }
+    if (static_cast<std::size_t>(k.size()) < score_offset + 8) {
+      break;
+    }
+    all.emplace_back(k.data() + score_offset + 8, k.size() - score_offset - 8);
+  }
+
+  auto const size = static_cast<int64_t>(all.size());
+  if (size == 0) {
+    return std::vector<std::string>{};
+  }
+
+  // クランプ規則は zrange と揃える。start を size-1 に丸めると
+  // 範囲外指定（例: size=3 で zrevrange 5 10）が空にならず 1 件返ってしまう。
   if (start < 0) start += size;
   if (stop < 0) stop += size;
   if (start < 0) start = 0;
   if (stop < 0) stop = 0;
-  if (start >= size) start = size - 1;
+  if (start >= size) start = size;
   if (stop >= size) stop = size - 1;
-  if (start > stop) return std::vector<std::string>{};
+  if (start > stop) {
+    return std::vector<std::string>{};
+  }
 
   auto const rev_start = size - 1 - stop;
   auto const rev_stop  = size - 1 - start;
-  auto const count = rev_stop - rev_start + 1;
 
   std::vector<std::string> result;
-  result.reserve(static_cast<std::size_t>(count));
-  for (auto i = rev_stop; i >= rev_start && i >= 0; --i) {
-    result.emplace_back(std::move((*all)[static_cast<std::size_t>(i)]));
+  result.reserve(static_cast<std::size_t>(rev_stop - rev_start + 1));
+  for (auto i = rev_stop; i >= rev_start; --i) {
+    result.emplace_back(std::move(all[static_cast<std::size_t>(i)]));
   }
   return result;
+}
+
+auto EmbeddedRedis::zrevrange(std::string_view key, int64_t start, int64_t stop) -> Result<std::vector<std::string>> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::string>> {
+    return impl_->zrevrange(txn, key, start, stop);
+  });
 }
 
 /**
@@ -2625,58 +2666,51 @@ auto EmbeddedRedis::zrevrange(std::string_view key, int64_t start, int64_t stop)
  * @copydoc EmbeddedRedis::zpopmin
  */
 auto EmbeddedRedis::zpopmin(std::string_view key) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  if (meta->size == 0) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    if (meta->size == 0) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(range_pfx);
+    auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(range_pfx);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  it->Seek(pfx_slice);
-  if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+    it->Seek(pfx_slice);
+    if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  auto const k = it->key();
-  auto const score_offset = suffix_offset(key);
-  auto const member = std::string(k.data() + score_offset + 8, k.size() - score_offset - 8);
+    auto const k = it->key();
+    auto const score_offset = suffix_offset(key);
+    auto const member = std::string(k.data() + score_offset + 8, k.size() - score_offset - 8);
 
-  // Get score from member key
-  auto const mk = encode_zset_member_key(key, meta->version, member);
-  std::string score_raw;
-  if (!impl_->db->Get(impl_->read_opts, mk, &score_raw).ok() || score_raw.size() != 8) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  auto const score = decode_score(reinterpret_cast<uint8_t const*>(score_raw.data()));
+    // Get score from member key
+    auto const mk = encode_zset_member_key(key, meta->version, member);
+    std::string score_raw;
+    if (!txn.Get(Impl::snap_opts(txn), mk, &score_raw).ok() || score_raw.size() != 8) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    auto const score = decode_score(reinterpret_cast<uint8_t const*>(score_raw.data()));
 
-  rocksdb::WriteBatch batch;
-  batch.Delete(mk);
-  batch.Delete(encode_zset_score_key(key, meta->version, score, member));
-  meta->size--;
-  if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
-  } else {
-    impl_->put_meta(batch, key, *meta);
-  }
+    std::ignore = txn.Delete(mk);
+    std::ignore = txn.Delete(encode_zset_score_key(key, meta->version, score, member));
+    meta->size--;
+    if (meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(key));
+    } else {
+      impl_->put_meta(txn, key, *meta);
+    }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return member;
+    return member;
+  });
 }
 
 /**
@@ -2685,57 +2719,50 @@ auto EmbeddedRedis::zpopmin(std::string_view key) -> Result<std::string> {
  * @copydoc EmbeddedRedis::zpopmax
  */
 auto EmbeddedRedis::zpopmax(std::string_view key) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
-  if (meta->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  if (meta->size == 0) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
+    if (meta->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    if (meta->size == 0) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(range_pfx);
+    auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(range_pfx);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  // Seek to last entry in the sorted set
-  it->SeekForPrev(encode_zset_score_seek_key(key, meta->version, std::numeric_limits<double>::max()));
-  // Walk backward to find the last entry within our prefix
-  while (it->Valid() && !it->key().starts_with(pfx_slice)) {
-    it->Prev();
-  }
-  if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
-    return std::unexpected(ErrorCode::NotFound);
-  }
+    // Seek to last entry in the sorted set
+    it->SeekForPrev(encode_zset_score_seek_key(key, meta->version, std::numeric_limits<double>::max()));
+    // Walk backward to find the last entry within our prefix
+    while (it->Valid() && !it->key().starts_with(pfx_slice)) {
+      it->Prev();
+    }
+    if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
+      return std::unexpected(ErrorCode::NotFound);
+    }
 
-  auto const k = it->key();
-  auto const score_offset = suffix_offset(key);
-  auto const member = std::string(k.data() + score_offset + 8, k.size() - score_offset - 8);
+    auto const k = it->key();
+    auto const score_offset = suffix_offset(key);
+    auto const member = std::string(k.data() + score_offset + 8, k.size() - score_offset - 8);
 
-  auto const mk = encode_zset_member_key(key, meta->version, member);
+    auto const mk = encode_zset_member_key(key, meta->version, member);
 
-  rocksdb::WriteBatch batch;
-  batch.Delete(mk);
-  batch.Delete(k);
-  meta->size--;
-  if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
-  } else {
-    impl_->put_meta(batch, key, *meta);
-  }
+    std::ignore = txn.Delete(mk);
+    std::ignore = txn.Delete(k);
+    meta->size--;
+    if (meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(key));
+    } else {
+      impl_->put_meta(txn, key, *meta);
+    }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return member;
+    return member;
+  });
 }
 
 /**
@@ -2744,28 +2771,27 @@ auto EmbeddedRedis::zpopmax(std::string_view key) -> Result<std::string> {
  * @copydoc EmbeddedRedis::zmscore
  */
 auto EmbeddedRedis::zmscore(std::string_view key, std::vector<std::string_view> const& members) -> Result<std::vector<std::optional<double>>> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return std::vector<std::optional<double>>(members.size(), std::nullopt);
-  }
-  if (meta->type != DataType::ZSet) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  std::vector<std::optional<double>> result;
-  result.reserve(members.size());
-  for (auto const& member : members) {
-    std::string raw;
-    if (impl_->db->Get(impl_->read_opts, encode_zset_member_key(key, meta->version, member), &raw).ok() && raw.size() == 8) {
-      result.emplace_back(decode_score(reinterpret_cast<uint8_t const*>(raw.data())));
-    } else {
-      result.emplace_back(std::nullopt);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::optional<double>>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::vector<std::optional<double>>(members.size(), std::nullopt);
     }
-  }
-  return result;
+    if (meta->type != DataType::ZSet) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+
+    std::vector<std::optional<double>> result;
+    result.reserve(members.size());
+    for (auto const& member : members) {
+      std::string raw;
+      if (txn.Get(Impl::snap_opts(txn), encode_zset_member_key(key, meta->version, member), &raw).ok() && raw.size() == 8) {
+        result.emplace_back(decode_score(reinterpret_cast<uint8_t const*>(raw.data())));
+      } else {
+        result.emplace_back(std::nullopt);
+      }
+    }
+    return result;
+  });
 }
 
 // ---- New ZSet Functions (Medium) ----
@@ -2776,32 +2802,31 @@ auto EmbeddedRedis::zmscore(std::string_view key, std::vector<std::string_view> 
  * @copydoc EmbeddedRedis::zrangebylex
  */
 auto EmbeddedRedis::zrangebylex(std::string_view key, std::string_view min, std::string_view max) -> Result<std::vector<std::string>> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
-  auto const meta = impl_->get_meta(key);
-  if (!meta) return std::vector<std::string>{};
-  if (meta->type != DataType::ZSet) return std::unexpected(ErrorCode::WrongType);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::string>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) return std::vector<std::string>{};
+    if (meta->type != DataType::ZSet) return std::unexpected(ErrorCode::WrongType);
 
-  auto const pfx = encode_zset_member_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-  auto const member_offset = suffix_offset(key);
+    auto const pfx = encode_zset_member_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+    auto const member_offset = suffix_offset(key);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  std::vector<std::string> result;
-  bool const no_min = (min == "-");
-  bool const no_max = (max == "+");
+    std::vector<std::string> result;
+    bool const no_min = (min == "-");
+    bool const no_max = (max == "+");
 
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    auto const member = std::string_view(k.data() + member_offset, k.size() - member_offset);
-    if (!no_min && member < min) continue;
-    if (!no_max && member > max) break;
-    result.emplace_back(member);
-  }
-  return result;
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      auto const member = std::string_view(k.data() + member_offset, k.size() - member_offset);
+      if (!no_min && member < min) continue;
+      if (!no_max && member > max) break;
+      result.emplace_back(member);
+    }
+    return result;
+  });
 }
 
 /**
@@ -2810,32 +2835,31 @@ auto EmbeddedRedis::zrangebylex(std::string_view key, std::string_view min, std:
  * @copydoc EmbeddedRedis::zlexcount
  */
 auto EmbeddedRedis::zlexcount(std::string_view key, std::string_view min, std::string_view max) -> Result<uint64_t> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
-  auto const meta = impl_->get_meta(key);
-  if (!meta) return 0;
-  if (meta->type != DataType::ZSet) return std::unexpected(ErrorCode::WrongType);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) return 0;
+    if (meta->type != DataType::ZSet) return std::unexpected(ErrorCode::WrongType);
 
-  auto const pfx = encode_zset_member_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-  auto const member_offset = suffix_offset(key);
+    auto const pfx = encode_zset_member_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+    auto const member_offset = suffix_offset(key);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  uint64_t count = 0;
-  bool const no_min = (min == "-");
-  bool const no_max = (max == "+");
+    uint64_t count = 0;
+    bool const no_min = (min == "-");
+    bool const no_max = (max == "+");
 
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    auto const member = std::string_view(k.data() + member_offset, k.size() - member_offset);
-    if (!no_min && member < min) continue;
-    if (!no_max && member > max) break;
-    count++;
-  }
-  return count;
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      auto const member = std::string_view(k.data() + member_offset, k.size() - member_offset);
+      if (!no_min && member < min) continue;
+      if (!no_max && member > max) break;
+      count++;
+    }
+    return count;
+  });
 }
 
 /**
@@ -2843,9 +2867,9 @@ auto EmbeddedRedis::zlexcount(std::string_view key, std::string_view min, std::s
  *
  * @copydoc EmbeddedRedis::zremrangebyrank
  */
-auto EmbeddedRedis::zremrangebyrank(std::string_view key, int64_t start, int64_t stop) -> Result<uint64_t> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
-  auto meta = impl_->get_meta(key);
+/** @brief zremrangebyrank の実体（引数を書き換えるため、再試行ごとに新しいコピーで実行する） */
+auto EmbeddedRedis::Impl::zremrangebyrank(rocksdb::Transaction& txn, std::string_view key, int64_t start, int64_t stop) -> Result<uint64_t> {
+  auto meta = get_meta(txn, key);
   if (!meta) return 0;
   if (meta->type != DataType::ZSet) return std::unexpected(ErrorCode::WrongType);
   if (meta->size == 0) return 0;
@@ -2861,9 +2885,7 @@ auto EmbeddedRedis::zremrangebyrank(std::string_view key, int64_t start, int64_t
   rocksdb::Slice const pfx_slice(range_pfx);
   auto const score_offset = suffix_offset(key);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+  std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(snap_iter_opts(txn)));
 
   std::vector<std::string> to_delete;
   std::vector<double> scores;
@@ -2884,22 +2906,24 @@ auto EmbeddedRedis::zremrangebyrank(std::string_view key, int64_t start, int64_t
 
   if (to_delete.empty()) return 0;
 
-  rocksdb::WriteBatch batch;
   for (std::size_t i = 0; i < to_delete.size(); ++i) {
-    batch.Delete(encode_zset_member_key(key, meta->version, to_delete[i]));
-    batch.Delete(encode_zset_score_key(key, meta->version, scores[i], to_delete[i]));
+    std::ignore = txn.Delete(encode_zset_member_key(key, meta->version, to_delete[i]));
+    std::ignore = txn.Delete(encode_zset_score_key(key, meta->version, scores[i], to_delete[i]));
   }
   meta->size -= to_delete.size();
   if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
+    std::ignore = txn.Delete(encode_meta_key(key));
   } else {
-    impl_->put_meta(batch, key, *meta);
+    put_meta(txn, key, *meta);
   }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return static_cast<uint64_t>(to_delete.size());
+}
+
+auto EmbeddedRedis::zremrangebyrank(std::string_view key, int64_t start, int64_t stop) -> Result<uint64_t> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    return impl_->zremrangebyrank(txn, key, start, stop);
+  });
 }
 
 /**
@@ -2908,52 +2932,47 @@ auto EmbeddedRedis::zremrangebyrank(std::string_view key, int64_t start, int64_t
  * @copydoc EmbeddedRedis::zremrangebyscore
  */
 auto EmbeddedRedis::zremrangebyscore(std::string_view key, double min, double max) -> Result<uint64_t> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
-  auto meta = impl_->get_meta(key);
-  if (!meta) return 0;
-  if (meta->type != DataType::ZSet) return std::unexpected(ErrorCode::WrongType);
-  if (meta->size == 0) return 0;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) return 0;
+    if (meta->type != DataType::ZSet) return std::unexpected(ErrorCode::WrongType);
+    if (meta->size == 0) return 0;
 
-  auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
-  auto const seek_key  = encode_zset_score_seek_key(key, meta->version, min);
-  rocksdb::Slice const pfx_slice(range_pfx);
-  auto const score_offset = suffix_offset(key);
+    auto const range_pfx = encode_zset_score_range_prefix(key, meta->version);
+    auto const seek_key  = encode_zset_score_seek_key(key, meta->version, min);
+    rocksdb::Slice const pfx_slice(range_pfx);
+    auto const score_offset = suffix_offset(key);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  std::vector<std::string> to_delete;
-  std::vector<double> scores;
+    std::vector<std::string> to_delete;
+    std::vector<double> scores;
 
-  for (it->Seek(seek_key); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    if (static_cast<std::size_t>(k.size()) < score_offset + 8) break;
-    auto const sc = decode_score(reinterpret_cast<uint8_t const*>(k.data() + score_offset));
-    if (sc > max) break;
-    to_delete.push_back(std::string(k.data() + score_offset + 8, k.size() - score_offset - 8));
-    scores.push_back(sc);
-  }
+    for (it->Seek(seek_key); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      if (static_cast<std::size_t>(k.size()) < score_offset + 8) break;
+      auto const sc = decode_score(reinterpret_cast<uint8_t const*>(k.data() + score_offset));
+      if (sc > max) break;
+      to_delete.push_back(std::string(k.data() + score_offset + 8, k.size() - score_offset - 8));
+      scores.push_back(sc);
+    }
 
-  if (to_delete.empty()) return 0;
+    if (to_delete.empty()) return 0;
 
-  rocksdb::WriteBatch batch;
-  for (std::size_t i = 0; i < to_delete.size(); ++i) {
-    batch.Delete(encode_zset_member_key(key, meta->version, to_delete[i]));
-    batch.Delete(encode_zset_score_key(key, meta->version, scores[i], to_delete[i]));
-  }
-  meta->size -= to_delete.size();
-  if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
-  } else {
-    impl_->put_meta(batch, key, *meta);
-  }
+    for (std::size_t i = 0; i < to_delete.size(); ++i) {
+      std::ignore = txn.Delete(encode_zset_member_key(key, meta->version, to_delete[i]));
+      std::ignore = txn.Delete(encode_zset_score_key(key, meta->version, scores[i], to_delete[i]));
+    }
+    meta->size -= to_delete.size();
+    if (meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(key));
+    } else {
+      impl_->put_meta(txn, key, *meta);
+    }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return static_cast<uint64_t>(to_delete.size());
+    return static_cast<uint64_t>(to_delete.size());
+  });
 }
 
 // ============================================================
@@ -2965,11 +2984,9 @@ auto EmbeddedRedis::zremrangebyscore(std::string_view key, double min, double ma
  *
  * @copydoc EmbeddedRedis::xadd
  */
-auto EmbeddedRedis::xadd(std::string_view key, std::string_view id, std::vector<std::pair<std::string, std::string>> const& fields) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const existing = impl_->get_meta(key);
+/** @brief xadd の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::xadd(rocksdb::Transaction& txn, std::string_view key, std::string_view id, std::vector<std::pair<std::string, std::string>> const& fields) -> Result<std::string> {
+  auto const existing = get_meta(txn, key);
   if (existing && existing->type != DataType::Stream) {
     return std::unexpected(ErrorCode::WrongType);
   }
@@ -3033,14 +3050,16 @@ auto EmbeddedRedis::xadd(std::string_view key, std::string_view id, std::vector<
   meta.last_seq = seq;
   meta.size++;
 
-  rocksdb::WriteBatch batch;
-  batch.Put(encode_stream_key(key, meta.version, ms, seq), data);
-  impl_->put_meta(batch, key, meta);
+  std::ignore = txn.Put(encode_stream_key(key, meta.version, ms, seq), data);
+  put_meta(txn, key, meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return std::format("{}-{}", ms, seq);
+}
+
+auto EmbeddedRedis::xadd(std::string_view key, std::string_view id, std::vector<std::pair<std::string, std::string>> const& fields) -> Result<std::string> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    return impl_->xadd(txn, key, id, fields);
+  });
 }
 
 // ---- New Stream Functions ----
@@ -3051,17 +3070,16 @@ auto EmbeddedRedis::xadd(std::string_view key, std::string_view id, std::vector<
  * @copydoc EmbeddedRedis::xlen
  */
 auto EmbeddedRedis::xlen(std::string_view key) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::Stream) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-  return meta->size;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return 0;
+    }
+    if (meta->type != DataType::Stream) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
+    return meta->size;
+  });
 }
 
 /**
@@ -3070,53 +3088,48 @@ auto EmbeddedRedis::xlen(std::string_view key) -> Result<uint64_t> {
  * @copydoc EmbeddedRedis::xdel
  */
 auto EmbeddedRedis::xdel(std::string_view key, std::vector<std::string_view> const& ids) -> Result<uint64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return 0;
-  }
-  if (meta->type != DataType::Stream) {
-    return std::unexpected(ErrorCode::WrongType);
-  }
-
-  rocksdb::WriteBatch batch;
-  uint64_t removed = 0;
-
-  for (auto const& id : ids) {
-    auto const dash = id.find('-');
-    if (dash == std::string_view::npos) continue;
-    uint64_t ms = 0, seq = 0;
-    auto r1 = std::from_chars(id.data(), id.data() + dash, ms);
-    auto r2 = std::from_chars(id.data() + dash + 1, id.data() + id.size(), seq);
-    if (r1.ec != std::errc{} || r2.ec != std::errc{}) continue;
-
-    auto const sk = encode_stream_key(key, meta->version, ms, seq);
-    std::string exist;
-    if (impl_->db->Get(impl_->read_opts, sk, &exist).ok()) {
-      batch.Delete(sk);
-      removed++;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) {
+      return 0;
     }
-  }
+    if (meta->type != DataType::Stream) {
+      return std::unexpected(ErrorCode::WrongType);
+    }
 
-  if (removed == 0) {
-    return 0;
-  }
+    uint64_t removed = 0;
 
-  // guard against inconsistent counts
-  if (removed > meta->size) removed = meta->size;
-  meta->size -= removed;
-  if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
-  } else {
-    impl_->put_meta(batch, key, *meta);
-  }
+    for (auto const& id : ids) {
+      auto const dash = id.find('-');
+      if (dash == std::string_view::npos) continue;
+      uint64_t ms = 0, seq = 0;
+      auto r1 = std::from_chars(id.data(), id.data() + dash, ms);
+      auto r2 = std::from_chars(id.data() + dash + 1, id.data() + id.size(), seq);
+      if (r1.ec != std::errc{} || r2.ec != std::errc{}) continue;
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return removed;
+      auto const sk = encode_stream_key(key, meta->version, ms, seq);
+      std::string exist;
+      if (txn.Get(Impl::snap_opts(txn), sk, &exist).ok()) {
+        std::ignore = txn.Delete(sk);
+        removed++;
+      }
+    }
+
+    if (removed == 0) {
+      return 0;
+    }
+
+    // guard against inconsistent counts
+    if (removed > meta->size) removed = meta->size;
+    meta->size -= removed;
+    if (meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(key));
+    } else {
+      impl_->put_meta(txn, key, *meta);
+    }
+
+    return removed;
+  });
 }
 
 // ---- New Stream Functions (Medium) ----
@@ -3148,69 +3161,68 @@ int compare_stream_id(uint64_t ms1, uint64_t seq1, uint64_t ms2, uint64_t seq2) 
  * @copydoc EmbeddedRedis::xrange
  */
 auto EmbeddedRedis::xrange(std::string_view key, std::string_view start, std::string_view end) -> Result<std::vector<StreamEntry>> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
-  auto const meta = impl_->get_meta(key);
-  if (!meta) return std::vector<StreamEntry>{};
-  if (meta->type != DataType::Stream) return std::unexpected(ErrorCode::WrongType);
-  if (meta->size == 0) return std::vector<StreamEntry>{};
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<StreamEntry>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) return std::vector<StreamEntry>{};
+    if (meta->type != DataType::Stream) return std::unexpected(ErrorCode::WrongType);
+    if (meta->size == 0) return std::vector<StreamEntry>{};
 
-  uint64_t start_ms = 0, start_seq = 0;
-  uint64_t end_ms = 0, end_seq = 0;
-  bool const has_start = parse_stream_id(start, start_ms, start_seq);
-  bool const has_end = parse_stream_id(end, end_ms, end_seq);
+    uint64_t start_ms = 0, start_seq = 0;
+    uint64_t end_ms = 0, end_seq = 0;
+    bool const has_start = parse_stream_id(start, start_ms, start_seq);
+    bool const has_end = parse_stream_id(end, end_ms, end_seq);
 
-  auto const pfx = encode_stream_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-  auto const ms_offset = suffix_offset(key);
-  auto const seq_offset = ms_offset + 8;
+    auto const pfx = encode_stream_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+    auto const ms_offset = suffix_offset(key);
+    auto const seq_offset = ms_offset + 8;
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  // Seek to start position
-  if (has_start) {
-    it->Seek(encode_stream_key(key, meta->version, start_ms, start_seq));
-  } else {
-    it->Seek(pfx_slice);
-  }
-
-  std::vector<StreamEntry> result;
-  for (; it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    if (static_cast<std::size_t>(k.size()) < seq_offset) break;
-
-    auto const cur_ms  = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + ms_offset));
-    auto const cur_seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
-
-    if (has_end && compare_stream_id(cur_ms, cur_seq, end_ms, end_seq) > 0) break;
-    if (has_start && compare_stream_id(cur_ms, cur_seq, start_ms, start_seq) < 0) continue;
-
-    // decode entry data
-    auto const v = it->value();
-    auto const* data = reinterpret_cast<uint8_t const*>(v.data());
-    auto const field_count = read_u32be(data);
-    std::size_t offset = 4;
-
-    StreamEntry entry;
-    entry.id = std::format("{}-{}", cur_ms, cur_seq);
-    for (uint32_t i = 0; i < field_count; ++i) {
-      if (offset + 4 > static_cast<std::size_t>(v.size())) break;
-      auto const klen = read_u32be(data + offset); offset += 4;
-      if (offset + klen > static_cast<std::size_t>(v.size())) break;
-      auto fk = std::string(v.data() + offset, klen);
-      offset += klen;
-      if (offset + 4 > static_cast<std::size_t>(v.size())) break;
-      auto const vlen = read_u32be(data + offset); offset += 4;
-      if (offset + vlen > static_cast<std::size_t>(v.size())) break;
-      auto fv = std::string(v.data() + offset, vlen);
-      offset += vlen;
-      entry.fields.emplace_back(std::move(fk), std::move(fv));
+    // Seek to start position
+    if (has_start) {
+      it->Seek(encode_stream_key(key, meta->version, start_ms, start_seq));
+    } else {
+      it->Seek(pfx_slice);
     }
-    result.push_back(std::move(entry));
-  }
-  return result;
+
+    std::vector<StreamEntry> result;
+    for (; it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      if (static_cast<std::size_t>(k.size()) < seq_offset) break;
+
+      auto const cur_ms  = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + ms_offset));
+      auto const cur_seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
+
+      if (has_end && compare_stream_id(cur_ms, cur_seq, end_ms, end_seq) > 0) break;
+      if (has_start && compare_stream_id(cur_ms, cur_seq, start_ms, start_seq) < 0) continue;
+
+      // decode entry data
+      auto const v = it->value();
+      auto const* data = reinterpret_cast<uint8_t const*>(v.data());
+      auto const field_count = read_u32be(data);
+      std::size_t offset = 4;
+
+      StreamEntry entry;
+      entry.id = std::format("{}-{}", cur_ms, cur_seq);
+      for (uint32_t i = 0; i < field_count; ++i) {
+        if (offset + 4 > static_cast<std::size_t>(v.size())) break;
+        auto const klen = read_u32be(data + offset); offset += 4;
+        if (offset + klen > static_cast<std::size_t>(v.size())) break;
+        auto fk = std::string(v.data() + offset, klen);
+        offset += klen;
+        if (offset + 4 > static_cast<std::size_t>(v.size())) break;
+        auto const vlen = read_u32be(data + offset); offset += 4;
+        if (offset + vlen > static_cast<std::size_t>(v.size())) break;
+        auto fv = std::string(v.data() + offset, vlen);
+        offset += vlen;
+        entry.fields.emplace_back(std::move(fk), std::move(fv));
+      }
+      result.push_back(std::move(entry));
+    }
+    return result;
+  });
 }
 
 /**
@@ -3219,77 +3231,76 @@ auto EmbeddedRedis::xrange(std::string_view key, std::string_view start, std::st
  * @copydoc EmbeddedRedis::xrevrange
  */
 auto EmbeddedRedis::xrevrange(std::string_view key, std::string_view start, std::string_view end) -> Result<std::vector<StreamEntry>> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
-  auto const meta = impl_->get_meta(key);
-  if (!meta) return std::vector<StreamEntry>{};
-  if (meta->type != DataType::Stream) return std::unexpected(ErrorCode::WrongType);
-  if (meta->size == 0) return std::vector<StreamEntry>{};
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<StreamEntry>> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) return std::vector<StreamEntry>{};
+    if (meta->type != DataType::Stream) return std::unexpected(ErrorCode::WrongType);
+    if (meta->size == 0) return std::vector<StreamEntry>{};
 
-  uint64_t start_ms = 0, start_seq = 0;
-  uint64_t end_ms = 0, end_seq = 0;
-  bool const has_start = parse_stream_id(start, start_ms, start_seq);
-  bool const has_end = parse_stream_id(end, end_ms, end_seq);
+    uint64_t start_ms = 0, start_seq = 0;
+    uint64_t end_ms = 0, end_seq = 0;
+    bool const has_start = parse_stream_id(start, start_ms, start_seq);
+    bool const has_end = parse_stream_id(end, end_ms, end_seq);
 
-  auto const pfx = encode_stream_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-  auto const ms_offset = suffix_offset(key);
-  auto const seq_offset = ms_offset + 8;
+    auto const pfx = encode_stream_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
+    auto const ms_offset = suffix_offset(key);
+    auto const seq_offset = ms_offset + 8;
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  // Seek to end (or max)
-  if (has_start) {
-    it->Seek(encode_stream_key(key, meta->version, start_ms, start_seq));
-    // Go past the first matching entry so we start from the one before
-    it->SeekForPrev(encode_stream_key(key, meta->version, start_ms, start_seq));
-  } else {
-    it->SeekForPrev(encode_stream_key(key, meta->version, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()));
-  }
-  // Walk back to prefix
-  while (it->Valid() && !it->key().starts_with(pfx_slice)) {
-    it->Prev();
-  }
-  if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
-    return std::vector<StreamEntry>{};
-  }
-
-  std::vector<StreamEntry> result;
-  for (; it->Valid(); it->Prev()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    if (static_cast<std::size_t>(k.size()) < seq_offset) continue;
-
-    auto const cur_ms  = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + ms_offset));
-    auto const cur_seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
-
-    if (has_end && compare_stream_id(cur_ms, cur_seq, end_ms, end_seq) < 0) break;
-    if (has_start && compare_stream_id(cur_ms, cur_seq, start_ms, start_seq) > 0) continue;
-
-    auto const v = it->value();
-    auto const* data = reinterpret_cast<uint8_t const*>(v.data());
-    auto const field_count = read_u32be(data);
-    std::size_t offset = 4;
-
-    StreamEntry entry;
-    entry.id = std::format("{}-{}", cur_ms, cur_seq);
-    for (uint32_t i = 0; i < field_count; ++i) {
-      if (offset + 4 > static_cast<std::size_t>(v.size())) break;
-      auto const klen = read_u32be(data + offset); offset += 4;
-      if (offset + klen > static_cast<std::size_t>(v.size())) break;
-      auto fk = std::string(v.data() + offset, klen);
-      offset += klen;
-      if (offset + 4 > static_cast<std::size_t>(v.size())) break;
-      auto const vlen = read_u32be(data + offset); offset += 4;
-      if (offset + vlen > static_cast<std::size_t>(v.size())) break;
-      auto fv = std::string(v.data() + offset, vlen);
-      offset += vlen;
-      entry.fields.emplace_back(std::move(fk), std::move(fv));
+    // Seek to end (or max)
+    if (has_start) {
+      it->Seek(encode_stream_key(key, meta->version, start_ms, start_seq));
+      // Go past the first matching entry so we start from the one before
+      it->SeekForPrev(encode_stream_key(key, meta->version, start_ms, start_seq));
+    } else {
+      it->SeekForPrev(encode_stream_key(key, meta->version, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()));
     }
-    result.push_back(std::move(entry));
-  }
-  return result;
+    // Walk back to prefix
+    while (it->Valid() && !it->key().starts_with(pfx_slice)) {
+      it->Prev();
+    }
+    if (!it->Valid() || !it->key().starts_with(pfx_slice)) {
+      return std::vector<StreamEntry>{};
+    }
+
+    std::vector<StreamEntry> result;
+    for (; it->Valid(); it->Prev()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      if (static_cast<std::size_t>(k.size()) < seq_offset) continue;
+
+      auto const cur_ms  = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + ms_offset));
+      auto const cur_seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
+
+      if (has_end && compare_stream_id(cur_ms, cur_seq, end_ms, end_seq) < 0) break;
+      if (has_start && compare_stream_id(cur_ms, cur_seq, start_ms, start_seq) > 0) continue;
+
+      auto const v = it->value();
+      auto const* data = reinterpret_cast<uint8_t const*>(v.data());
+      auto const field_count = read_u32be(data);
+      std::size_t offset = 4;
+
+      StreamEntry entry;
+      entry.id = std::format("{}-{}", cur_ms, cur_seq);
+      for (uint32_t i = 0; i < field_count; ++i) {
+        if (offset + 4 > static_cast<std::size_t>(v.size())) break;
+        auto const klen = read_u32be(data + offset); offset += 4;
+        if (offset + klen > static_cast<std::size_t>(v.size())) break;
+        auto fk = std::string(v.data() + offset, klen);
+        offset += klen;
+        if (offset + 4 > static_cast<std::size_t>(v.size())) break;
+        auto const vlen = read_u32be(data + offset); offset += 4;
+        if (offset + vlen > static_cast<std::size_t>(v.size())) break;
+        auto fv = std::string(v.data() + offset, vlen);
+        offset += vlen;
+        entry.fields.emplace_back(std::move(fk), std::move(fv));
+      }
+      result.push_back(std::move(entry));
+    }
+    return result;
+  });
 }
 
 /**
@@ -3298,43 +3309,38 @@ auto EmbeddedRedis::xrevrange(std::string_view key, std::string_view start, std:
  * @copydoc EmbeddedRedis::xtrim
  */
 auto EmbeddedRedis::xtrim(std::string_view key, uint64_t maxlen) -> Result<uint64_t> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
-  auto meta = impl_->get_meta(key);
-  if (!meta) return 0;
-  if (meta->type != DataType::Stream) return std::unexpected(ErrorCode::WrongType);
-  if (meta->size <= maxlen) return 0;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<uint64_t> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) return 0;
+    if (meta->type != DataType::Stream) return std::unexpected(ErrorCode::WrongType);
+    if (meta->size <= maxlen) return 0;
 
-  auto const pfx = encode_stream_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
+    auto const pfx = encode_stream_prefix(key, meta->version);
+    rocksdb::Slice const pfx_slice(pfx);
 
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(iter_opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  uint64_t to_remove = meta->size - maxlen;
-  rocksdb::WriteBatch batch;
+    uint64_t to_remove = meta->size - maxlen;
 
-  uint64_t removed = 0;
-  for (it->Seek(pfx_slice); it->Valid() && removed < to_remove; it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    batch.Delete(k);
-    removed++;
-  }
+    uint64_t removed = 0;
+    for (it->Seek(pfx_slice); it->Valid() && removed < to_remove; it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      std::ignore = txn.Delete(k);
+      removed++;
+    }
 
-  if (removed == 0) return 0;
+    if (removed == 0) return 0;
 
-  meta->size -= removed;
-  if (meta->size == 0) {
-    batch.Delete(encode_meta_key(key));
-  } else {
-    impl_->put_meta(batch, key, *meta);
-  }
+    meta->size -= removed;
+    if (meta->size == 0) {
+      std::ignore = txn.Delete(encode_meta_key(key));
+    } else {
+      impl_->put_meta(txn, key, *meta);
+    }
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return removed;
+    return removed;
+  });
 }
 
 // ============================================================
@@ -3346,30 +3352,29 @@ auto EmbeddedRedis::xtrim(std::string_view key, uint64_t maxlen) -> Result<uint6
  *
  * @copydoc EmbeddedRedis::del
  */
-auto EmbeddedRedis::del(std::string_view key) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
+/** @brief del の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::del(rocksdb::Transaction& txn, std::string_view key) -> Result<bool> {
+  auto const meta = get_meta(txn, key);
   if (!meta) {
     return false;
   }
 
-  rocksdb::WriteBatch batch;
-  impl_->erase_key_data(batch, key, *meta);
+  erase_key_data(txn, key, *meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return true;
+}
+
+auto EmbeddedRedis::del(std::string_view key) -> Result<bool> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->del(txn, key);
+  });
 }
 
 /** @brief キーの存在確認 @copydoc EmbeddedRedis::exists */
 auto EmbeddedRedis::exists(std::string_view key) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return impl_->get_meta(key).has_value();
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->get_meta_ro(txn, key).has_value();
+  });
 }
 
 /**
@@ -3378,22 +3383,21 @@ auto EmbeddedRedis::exists(std::string_view key) -> Result<bool> {
  * @copydoc EmbeddedRedis::type
  */
 auto EmbeddedRedis::type(std::string_view key) -> Result<std::string> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return std::string("none");
+    }
+    switch (meta->type) {
+    case DataType::String: return std::string("string");
+    case DataType::Hash:   return std::string("hash");
+    case DataType::List:   return std::string("list");
+    case DataType::Set:    return std::string("set");
+    case DataType::ZSet:   return std::string("zset");
+    case DataType::Stream: return std::string("stream");
+    }
     return std::string("none");
-  }
-  switch (meta->type) {
-  case DataType::String: return std::string("string");
-  case DataType::Hash:   return std::string("hash");
-  case DataType::List:   return std::string("list");
-  case DataType::Set:    return std::string("set");
-  case DataType::ZSet:   return std::string("zset");
-  case DataType::Stream: return std::string("stream");
-  }
-  return std::string("none");
+  });
 }
 
 /**
@@ -3411,23 +3415,18 @@ auto EmbeddedRedis::expireat(std::string_view key, uint64_t unix_time) -> Result
  * @copydoc EmbeddedRedis::pexpireat
  */
 auto EmbeddedRedis::pexpireat(std::string_view key, uint64_t unix_time) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return false;
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    auto meta = impl_->get_meta(txn, key);
+    if (!meta) {
+      return false;
+    }
 
-  meta->expiration_ms = unix_time;
+    meta->expiration_ms = unix_time;
 
-  rocksdb::WriteBatch batch;
-  impl_->put_meta(batch, key, *meta);
+    impl_->put_meta(txn, key, *meta);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  return true;
+    return true;
+  });
 }
 
 /**
@@ -3436,15 +3435,14 @@ auto EmbeddedRedis::pexpireat(std::string_view key, uint64_t unix_time) -> Resul
  * @copydoc EmbeddedRedis::touch
  */
 auto EmbeddedRedis::touch(std::string_view key) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto meta = impl_->get_meta(key);
-  if (!meta) {
-    return false;
-  }
-  // RocksDB ベースの組み込み DB では touch の効果は限定的だが、TTL 期限切れは検出する
-  return true;
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    auto meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return false;
+    }
+    // RocksDB ベースの組み込み DB では touch の効果は限定的だが、TTL 期限切れは検出する
+    return true;
+  });
 }
 
 // ============================================================
@@ -3480,11 +3478,9 @@ auto EmbeddedRedis::ttl(std::string_view key) -> Result<int64_t> {
  * @brief キーに有効期限を設定する（ミリ秒）
  * @copydoc EmbeddedRedis::pexpire
  */
-auto EmbeddedRedis::pexpire(std::string_view key, uint64_t milliseconds) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
+/** @brief pexpire の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::pexpire(rocksdb::Transaction& txn, std::string_view key, uint64_t milliseconds) -> Result<bool> {
+  auto const meta = get_meta(txn, key);
   if (!meta) {
     return false;
   }
@@ -3492,13 +3488,15 @@ auto EmbeddedRedis::pexpire(std::string_view key, uint64_t milliseconds) -> Resu
   auto updated = *meta;
   updated.expiration_ms = now_ms() + milliseconds;
 
-  rocksdb::WriteBatch batch;
-  impl_->put_meta(batch, key, updated);
+  put_meta(txn, key, updated);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return true;
+}
+
+auto EmbeddedRedis::pexpire(std::string_view key, uint64_t milliseconds) -> Result<bool> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->pexpire(txn, key, milliseconds);
+  });
 }
 
 /**
@@ -3507,22 +3505,21 @@ auto EmbeddedRedis::pexpire(std::string_view key, uint64_t milliseconds) -> Resu
  * @copydoc EmbeddedRedis::pttl
  */
 auto EmbeddedRedis::pttl(std::string_view key) -> Result<int64_t> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
-  if (!meta) {
-    return -1;
-  }
-  if (meta->expiration_ms == 0) {
-    return -1;
-  }
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<int64_t> {
+    auto const meta = impl_->get_meta_ro(txn, key);
+    if (!meta) {
+      return -1;
+    }
+    if (meta->expiration_ms == 0) {
+      return -1;
+    }
 
-  auto const now = now_ms();
-  if (now >= meta->expiration_ms) {
-    return -2;
-  }
-  return static_cast<int64_t>(meta->expiration_ms - now);
+    auto const now = now_ms();
+    if (now >= meta->expiration_ms) {
+      return -2;
+    }
+    return static_cast<int64_t>(meta->expiration_ms - now);
+  });
 }
 
 /**
@@ -3530,11 +3527,9 @@ auto EmbeddedRedis::pttl(std::string_view key) -> Result<int64_t> {
  *
  * @copydoc EmbeddedRedis::persist
  */
-auto EmbeddedRedis::persist(std::string_view key) -> Result<bool> {
-  if (!is_open()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
-  auto const meta = impl_->get_meta(key);
+/** @brief persist の実体（Pipeline と共有） */
+auto EmbeddedRedis::Impl::persist(rocksdb::Transaction& txn, std::string_view key) -> Result<bool> {
+  auto const meta = get_meta(txn, key);
   if (!meta) {
     return false;
   }
@@ -3545,13 +3540,15 @@ auto EmbeddedRedis::persist(std::string_view key) -> Result<bool> {
   auto updated = *meta;
   updated.expiration_ms = 0;
 
-  rocksdb::WriteBatch batch;
-  impl_->put_meta(batch, key, updated);
+  put_meta(txn, key, updated);
 
-  if (!impl_->db->Write(impl_->write_opts, &batch).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
   return true;
+}
+
+auto EmbeddedRedis::persist(std::string_view key) -> Result<bool> {
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<bool> {
+    return impl_->persist(txn, key);
+  });
 }
 
 // ---- New Generic Functions (Medium) ----
@@ -3593,32 +3590,31 @@ bool glob_match(std::string_view pattern, std::string_view str) {
  * @copydoc EmbeddedRedis::randomkey
  */
 auto EmbeddedRedis::randomkey() -> Result<std::string> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::string> {
 
-  rocksdb::ReadOptions opts;
-  opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  std::string const meta_pfx(1, static_cast<char>(prefix::Meta));
-  rocksdb::Slice const pfx_slice(meta_pfx);
+    std::string const meta_pfx(1, static_cast<char>(prefix::Meta));
+    rocksdb::Slice const pfx_slice(meta_pfx);
 
-  // Reservoir sampling: pick one random key
-  std::string result;
-  uint64_t count = 0;
+    // Reservoir sampling: pick one random key
+    std::string result;
+    uint64_t count = 0;
 
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    if (k.size() < 2) continue;
-    count++;
-    if (count == 1) {
-      result.assign(k.data() + 1, k.size() - 1);
-    } else if (rand() % count == 0) {
-      result.assign(k.data() + 1, k.size() - 1);
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      if (k.size() < 2) continue;
+      count++;
+      if (count == 1) {
+        result.assign(k.data() + 1, k.size() - 1);
+      } else if (random_below(count) == 0) {
+        result.assign(k.data() + 1, k.size() - 1);
+      }
     }
-  }
-  if (count == 0) return std::unexpected(ErrorCode::NotFound);
-  return result;
+    if (count == 0) return std::unexpected(ErrorCode::NotFound);
+    return result;
+  });
 }
 
 /**
@@ -3627,26 +3623,25 @@ auto EmbeddedRedis::randomkey() -> Result<std::string> {
  * @copydoc EmbeddedRedis::keys
  */
 auto EmbeddedRedis::keys(std::string_view pattern) -> Result<std::vector<std::string>> {
-  if (!is_open()) return std::unexpected(ErrorCode::RocksDBError);
+  return impl_->run_txn([&](rocksdb::Transaction& txn) -> Result<std::vector<std::string>> {
 
-  rocksdb::ReadOptions opts;
-  opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(impl_->db->NewIterator(opts));
+    std::unique_ptr<rocksdb::Iterator> it(txn.GetIterator(Impl::snap_iter_opts(txn)));
 
-  std::string const meta_pfx(1, static_cast<char>(prefix::Meta));
-  rocksdb::Slice const pfx_slice(meta_pfx);
+    std::string const meta_pfx(1, static_cast<char>(prefix::Meta));
+    rocksdb::Slice const pfx_slice(meta_pfx);
 
-  std::vector<std::string> result;
-  for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-    auto const k = it->key();
-    if (!k.starts_with(pfx_slice)) break;
-    if (k.size() < 2) continue;
-    auto const key_str = std::string_view(k.data() + 1, k.size() - 1);
-    if (glob_match(pattern, key_str)) {
-      result.emplace_back(key_str);
+    std::vector<std::string> result;
+    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
+      auto const k = it->key();
+      if (!k.starts_with(pfx_slice)) break;
+      if (k.size() < 2) continue;
+      auto const key_str = std::string_view(k.data() + 1, k.size() - 1);
+      if (glob_match(pattern, key_str)) {
+        result.emplace_back(key_str);
+      }
     }
-  }
-  return result;
+    return result;
+  });
 }
 
 // ============================================================
@@ -3657,386 +3652,83 @@ auto EmbeddedRedis::pipeline() -> Pipeline {
   return Pipeline(*this);
 }
 
-auto EmbeddedRedis::Pipeline::get_meta_cached(std::string_view key) -> std::optional<MetaValue> {
-  auto const key_str = std::string(key);
-  if (deleted_meta_cache_.contains(key_str)) {
-    return std::nullopt;
+/**
+ * @brief Pipeline を構築し、専用のトランザクションを開始する
+ * @note DB が開けていない場合はトランザクションを持たず、以降の操作は何もしない。
+ *   exec() は RocksDBError を返す（以前は null 参照でクラッシュしていた）。
+ */
+EmbeddedRedis::Pipeline::Pipeline(EmbeddedRedis& db) : db_(db) {
+  if (!db_.is_open()) {
+    error_ = ErrorCode::RocksDBError;
+    return;
   }
-  auto it = meta_cache_.find(key_str);
-  if (it != meta_cache_.end()) {
-    return it->second;
-  }
-  auto meta = db_.impl_->get_meta(key);
-  if (meta) {
-    meta_cache_[key_str] = *meta;
-  }
-  return meta;
+  rocksdb::OptimisticTransactionOptions txn_opts;
+  txn_opts.set_snapshot = true;
+  txn_.reset(db_.impl_->txn_db->BeginTransaction(db_.impl_->write_opts, txn_opts));
 }
 
-void EmbeddedRedis::Pipeline::update_meta_cache(std::string_view key, MetaValue const& meta) {
-  auto const key_str = std::string(key);
-  deleted_meta_cache_.erase(key_str);
-  meta_cache_[key_str] = meta;
+EmbeddedRedis::Pipeline::~Pipeline() {
+  if (txn_) {
+    std::ignore = txn_->Rollback();
+  }
 }
 
-void EmbeddedRedis::Pipeline::clear_state_cache(std::string_view key) {
-  auto const key_str = std::string(key);
-  string_state_cache_.erase(key_str);
-  hash_field_state_cache_.erase(key_str);
-  set_member_state_cache_.erase(key_str);
-  zset_member_state_cache_.erase(key_str);
+EmbeddedRedis::Pipeline::Pipeline(Pipeline&&) noexcept = default;
+
+bool EmbeddedRedis::Pipeline::usable() const noexcept {
+  return txn_ != nullptr && !error_;
 }
 
-auto EmbeddedRedis::Pipeline::get_string_value_cached(std::string_view key) -> std::optional<std::string> {
-  auto const key_str = std::string(key);
-  if (auto const it = string_state_cache_.find(key_str); it != string_state_cache_.end()) {
-    return it->second;
-  }
-
-  auto const meta = get_meta_cached(key);
-  if (!meta || meta->type != DataType::String) {
-    string_state_cache_[key_str] = std::nullopt;
-    return std::nullopt;
-  }
-
-  std::string value;
-  if (!db_.impl_->db->Get(db_.impl_->read_opts, encode_string_key(key), &value).ok()) {
-    string_state_cache_[key_str] = std::nullopt;
-    return std::nullopt;
-  }
-
-  string_state_cache_[key_str] = value;
-  return value;
-}
-
-auto EmbeddedRedis::Pipeline::get_hash_field_exists_cached(std::string_view key, uint64_t version, std::string_view field) -> bool {
-  auto const key_str = std::string(key);
-  auto const field_str = std::string(field);
-  if (auto key_it = hash_field_state_cache_.find(key_str); key_it != hash_field_state_cache_.end()) {
-    if (auto field_it = key_it->second.find(field_str); field_it != key_it->second.end()) {
-      return field_it->second;
-    }
-  }
-  if (reset_state_cache_.contains(key_str)) {
-    hash_field_state_cache_[key_str][field_str] = false;
-    return false;
-  }
-
-  std::string dummy;
-  auto const exists = db_.impl_->db->Get(db_.impl_->read_opts, encode_hash_key(key, version, field), &dummy).ok();
-  hash_field_state_cache_[key_str][field_str] = exists;
-  return exists;
-}
-
-auto EmbeddedRedis::Pipeline::get_set_member_exists_cached(std::string_view key, uint64_t version, std::string_view member) -> bool {
-  auto const key_str = std::string(key);
-  auto const member_str = std::string(member);
-  if (auto key_it = set_member_state_cache_.find(key_str); key_it != set_member_state_cache_.end()) {
-    if (auto member_it = key_it->second.find(member_str); member_it != key_it->second.end()) {
-      return member_it->second;
-    }
-  }
-  if (reset_state_cache_.contains(key_str)) {
-    set_member_state_cache_[key_str][member_str] = false;
-    return false;
-  }
-
-  std::string dummy;
-  auto const exists = db_.impl_->db->Get(db_.impl_->read_opts, encode_set_key(key, version, member), &dummy).ok();
-  set_member_state_cache_[key_str][member_str] = exists;
-  return exists;
-}
-
-auto EmbeddedRedis::Pipeline::get_zset_member_score_cached(std::string_view key, uint64_t version, std::string_view member) -> std::optional<double> {
-  auto const key_str = std::string(key);
-  auto const member_str = std::string(member);
-  if (auto key_it = zset_member_state_cache_.find(key_str); key_it != zset_member_state_cache_.end()) {
-    if (auto member_it = key_it->second.find(member_str); member_it != key_it->second.end()) {
-      return member_it->second;
-    }
-  }
-  if (reset_state_cache_.contains(key_str)) {
-    zset_member_state_cache_[key_str][member_str] = std::nullopt;
-    return std::nullopt;
-  }
-
-  std::string score_raw;
-  if (!db_.impl_->db->Get(db_.impl_->read_opts, encode_zset_member_key(key, version, member), &score_raw).ok() || score_raw.size() != 8) {
-    zset_member_state_cache_[key_str][member_str] = std::nullopt;
-    return std::nullopt;
-  }
-
-  auto const score = decode_score(reinterpret_cast<uint8_t const*>(score_raw.data()));
-  zset_member_state_cache_[key_str][member_str] = score;
-  return score;
-}
+/**
+ * @brief Impl の共有実装を呼び出し、失敗したらエラーを記録する
+ * @details Pipeline 版と単発版でロジックが分岐しないよう、実体は必ず Impl 側を使う
+ */
+#define REDISMM_PIPELINE_OP(EXPR)                                                                                      \
+  do {                                                                                                                 \
+    if (!usable()) {                                                                                                   \
+      return *this;                                                                                                    \
+    }                                                                                                                  \
+    if (auto const r = (EXPR); !r) {                                                                                   \
+      set_error(r.error());                                                                                            \
+    }                                                                                                                  \
+    return *this;                                                                                                      \
+  } while (false)
 
 auto EmbeddedRedis::Pipeline::set(std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms) -> Pipeline& {
-  auto existing = get_meta_cached(key);
-
-  // 既存キーが別の型なら先に全削除する
-  if (existing && existing->type != DataType::String) {
-    db_.impl_->erase_key_data(batch_, key, *existing);
-    clear_state_cache(key);
-    reset_state_cache_.insert(std::string(key));
-    existing = std::nullopt;
-  }
-
-  MetaValue meta;
-  meta.type          = DataType::String;
-  meta.version       = 1;
-  meta.size          = value.size();
-  meta.expiration_ms = ttl_ms ? now_ms() + *ttl_ms : 0;
-
-  db_.impl_->put_meta(batch_, key, meta);
-  batch_.Put(encode_string_key(key), rocksdb::Slice(value.data(), value.size()));
-  string_state_cache_[std::string(key)] = std::string(value);
-  update_meta_cache(key, meta);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->set(*txn_, key, value, ttl_ms));
 }
 
 auto EmbeddedRedis::Pipeline::hset(std::string_view key, std::string_view field, std::string_view value) -> Pipeline& {
-  auto existing = get_meta_cached(key);
-  if (existing && existing->type != DataType::Hash) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-
-  MetaValue meta;
-  if (existing) {
-    meta = *existing;
-  } else {
-    meta.type = DataType::Hash;
-  }
-
-  auto const hk = encode_hash_key(key, meta.version, field);
-
-  if (!get_hash_field_exists_cached(key, meta.version, field)) {
-    meta.size++;
-  }
-
-  batch_.Put(hk, rocksdb::Slice(value.data(), value.size()));
-  hash_field_state_cache_[std::string(key)][std::string(field)] = true;
-  db_.impl_->put_meta(batch_, key, meta);
-  update_meta_cache(key, meta);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->hset(*txn_, key, field, value));
 }
 
 auto EmbeddedRedis::Pipeline::lpush(std::string_view key, std::string_view value) -> Pipeline& {
-  auto existing = get_meta_cached(key);
-  if (existing && existing->type != DataType::List) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-
-  auto meta = init_list_meta(existing);
-  meta.head_seq--;
-  meta.size++;
-
-  batch_.Put(encode_list_key(key, meta.version, meta.head_seq), rocksdb::Slice(value.data(), value.size()));
-  db_.impl_->put_meta(batch_, key, meta);
-  update_meta_cache(key, meta);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->lpush(*txn_, key, value));
 }
 
 auto EmbeddedRedis::Pipeline::rpush(std::string_view key, std::string_view value) -> Pipeline& {
-  auto existing = get_meta_cached(key);
-  if (existing && existing->type != DataType::List) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-
-  auto meta = init_list_meta(existing);
-
-  batch_.Put(encode_list_key(key, meta.version, meta.tail_seq), rocksdb::Slice(value.data(), value.size()));
-  meta.tail_seq++;
-  meta.size++;
-  db_.impl_->put_meta(batch_, key, meta);
-  update_meta_cache(key, meta);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->rpush(*txn_, key, value));
 }
 
 auto EmbeddedRedis::Pipeline::sadd(std::string_view key, std::string_view member) -> Pipeline& {
-  auto existing = get_meta_cached(key);
-  if (existing && existing->type != DataType::Set) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-
-  MetaValue meta;
-  if (existing) {
-    meta = *existing;
-  } else {
-    meta.type = DataType::Set;
-  }
-
-  auto const sk = encode_set_key(key, meta.version, member);
-
-  if (!get_set_member_exists_cached(key, meta.version, member)) {
-    meta.size++;
-  }
-
-  batch_.Put(sk, rocksdb::Slice());
-  set_member_state_cache_[std::string(key)][std::string(member)] = true;
-  db_.impl_->put_meta(batch_, key, meta);
-  update_meta_cache(key, meta);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->sadd(*txn_, key, member));
 }
 
 auto EmbeddedRedis::Pipeline::srem(std::string_view key, std::string_view member) -> Pipeline& {
-  auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::Set) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-
-  auto const sk = encode_set_key(key, meta->version, member);
-
-  if (!get_set_member_exists_cached(key, meta->version, member)) {
-    return *this;
-  }
-
-  batch_.Delete(sk);
-  set_member_state_cache_[std::string(key)][std::string(member)] = false;
-  meta->size--;
-  if (meta->size == 0) {
-    batch_.Delete(encode_meta_key(key));
-    auto const key_str = std::string(key);
-    meta_cache_.erase(key_str);
-    deleted_meta_cache_.insert(key_str);
-    clear_state_cache(key);
-    reset_state_cache_.insert(key_str);
-  } else {
-    db_.impl_->put_meta(batch_, key, *meta);
-    update_meta_cache(key, *meta);
-  }
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->srem(*txn_, key, member));
 }
 
 auto EmbeddedRedis::Pipeline::zadd(std::string_view key, double score, std::string_view member) -> Pipeline& {
-  auto existing = get_meta_cached(key);
-  if (existing && existing->type != DataType::ZSet) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-
-  MetaValue meta;
-  if (existing) {
-    meta = *existing;
-  } else {
-    meta.type = DataType::ZSet;
-  }
-
-  auto const mk = encode_zset_member_key(key, meta.version, member);
-
-  if (auto const old_score = get_zset_member_score_cached(key, meta.version, member)) {
-    batch_.Delete(encode_zset_score_key(key, meta.version, *old_score, member));
-  } else {
-    meta.size++;
-  }
-
-  // member key → score(8byte encoded)
-  auto const sb = encode_score(score);
-  batch_.Put(mk, rocksdb::Slice(reinterpret_cast<char const*>(sb.data()), 8));
-
-  // score key → empty
-  batch_.Put(encode_zset_score_key(key, meta.version, score, member), rocksdb::Slice());
-  zset_member_state_cache_[std::string(key)][std::string(member)] = score;
-  db_.impl_->put_meta(batch_, key, meta);
-  update_meta_cache(key, meta);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->zadd(*txn_, key, score, member));
 }
 
-auto EmbeddedRedis::Pipeline::xadd(std::string_view key, std::string_view id, std::vector<std::pair<std::string, std::string>> const& fields) -> Pipeline& {
-  auto existing = get_meta_cached(key);
-  if (existing && existing->type != DataType::Stream) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-
-  MetaValue meta;
-  if (existing) {
-    meta = *existing;
-  } else {
-    meta.type = DataType::Stream;
-  }
-
-  uint64_t ms  = 0;
-  uint64_t seq = 0;
-
-  if (id == "*") {
-    // 自動 ID 生成: 現在時刻。同一ミリ秒内ならシーケンスをインクリメント
-    ms = now_ms();
-    if (ms > meta.last_ms) {
-      seq = 0;
-    } else {
-      ms  = meta.last_ms;
-      seq = meta.last_seq + 1;
-    }
-  } else {
-    // "ms-seq" 書式のパース
-    auto const dash = id.find('-');
-    if (dash == std::string_view::npos) {
-      set_error(ErrorCode::InvalidArgument);
-      return *this; // InvalidArgument
-    }
-    auto const ms_sv  = id.substr(0, dash);
-    auto const seq_sv = id.substr(dash + 1);
-    auto       r1     = std::from_chars(ms_sv.data(), ms_sv.data() + ms_sv.size(), ms);
-    auto       r2     = std::from_chars(seq_sv.data(), seq_sv.data() + seq_sv.size(), seq);
-    if (r1.ec != std::errc{} || r2.ec != std::errc{}) {
-      set_error(ErrorCode::InvalidArgument);
-      return *this; // InvalidArgument
-    }
-    // 単調増加チェック: 以前の ID より大きくなければならない
-    if (ms < meta.last_ms || (ms == meta.last_ms && seq <= meta.last_seq)) {
-      set_error(ErrorCode::InvalidArgument);
-      return *this; // InvalidArgument
-    }
-  }
-
-  // フィールドのシリアライズ: [count(4BE)] + { [klen(4BE)][key][vlen(4BE)][val] }
-  auto const  fc   = static_cast<uint32_t>(fields.size());
-  std::string data;
-  data.resize(4);
-  write_u32be(reinterpret_cast<uint8_t*>(data.data()), fc);
-
-  for (auto const& [fk, fv] : fields) {
-    auto const klen = static_cast<uint32_t>(fk.size());
-    auto const vlen = static_cast<uint32_t>(fv.size());
-    data.resize(data.size() + 4);
-    write_u32be(reinterpret_cast<uint8_t*>(data.data() + data.size() - 4), klen);
-    data.append(fk);
-    data.resize(data.size() + 4);
-    write_u32be(reinterpret_cast<uint8_t*>(data.data() + data.size() - 4), vlen);
-    data.append(fv);
-  }
-
-  meta.last_ms  = ms;
-  meta.last_seq = seq;
-  meta.size++;
-
-  batch_.Put(encode_stream_key(key, meta.version, ms, seq), data);
-  db_.impl_->put_meta(batch_, key, meta);
-  update_meta_cache(key, meta);
-  return *this;
+auto EmbeddedRedis::Pipeline::xadd(std::string_view key, std::string_view id,
+                                   std::vector<std::pair<std::string, std::string>> const& fields) -> Pipeline& {
+  REDISMM_PIPELINE_OP(db_.impl_->xadd(*txn_, key, id, fields));
 }
 
 auto EmbeddedRedis::Pipeline::del(std::string_view key) -> Pipeline& {
-  auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  db_.impl_->erase_key_data(batch_, key, *meta);
-  auto const key_str = std::string(key);
-  meta_cache_.erase(key_str);
-  deleted_meta_cache_.insert(key_str);
-  clear_state_cache(key);
-  reset_state_cache_.insert(key_str);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->del(*txn_, key));
 }
 
 auto EmbeddedRedis::Pipeline::expire(std::string_view key, uint64_t seconds) -> Pipeline& {
@@ -4044,285 +3736,68 @@ auto EmbeddedRedis::Pipeline::expire(std::string_view key, uint64_t seconds) -> 
 }
 
 auto EmbeddedRedis::Pipeline::pexpire(std::string_view key, uint64_t milliseconds) -> Pipeline& {
-  auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-
-  auto updated = *meta;
-  updated.expiration_ms = now_ms() + milliseconds;
-
-  db_.impl_->put_meta(batch_, key, updated);
-  update_meta_cache(key, updated);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->pexpire(*txn_, key, milliseconds));
 }
 
 auto EmbeddedRedis::Pipeline::persist(std::string_view key) -> Pipeline& {
-  auto meta = get_meta_cached(key);
-  if (!meta || meta->expiration_ms == 0) {
-    return *this;
-  }
-
-  auto updated = *meta;
-  updated.expiration_ms = 0;
-
-  db_.impl_->put_meta(batch_, key, updated);
-  update_meta_cache(key, updated);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->persist(*txn_, key));
 }
 
 auto EmbeddedRedis::Pipeline::append(std::string_view key, std::string_view value) -> Pipeline& {
-  auto existing = get_meta_cached(key);
-  if (existing && existing->type != DataType::String) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-
-  std::string current;
-  if (auto cached = get_string_value_cached(key)) {
-    current = std::move(*cached);
-  }
-
-  current += value;
-
-  MetaValue meta;
-  meta.type    = DataType::String;
-  meta.version = existing ? existing->version : 1;
-  meta.size    = current.size();
-
-  db_.impl_->put_meta(batch_, key, meta);
-  batch_.Put(encode_string_key(key), rocksdb::Slice(current));
-  string_state_cache_[std::string(key)] = current;
-  update_meta_cache(key, meta);
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->append(*txn_, key, value));
 }
 
 auto EmbeddedRedis::Pipeline::hdel(std::string_view key, std::string_view field) -> Pipeline& {
-  auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::Hash) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-  if (meta->size == 0) {
-    return *this;
-  }
-
-  auto const hk = encode_hash_key(key, meta->version, field);
-  if (!get_hash_field_exists_cached(key, meta->version, field)) {
-    return *this;
-  }
-
-  batch_.Delete(hk);
-  hash_field_state_cache_[std::string(key)][std::string(field)] = false;
-  meta->size--;
-  if (meta->size == 0) {
-    batch_.Delete(encode_meta_key(key));
-    auto const key_str = std::string(key);
-    meta_cache_.erase(key_str);
-    deleted_meta_cache_.insert(key_str);
-    clear_state_cache(key);
-    reset_state_cache_.insert(key_str);
-  } else {
-    db_.impl_->put_meta(batch_, key, *meta);
-    update_meta_cache(key, *meta);
-  }
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->hdel(*txn_, key, field));
 }
 
 auto EmbeddedRedis::Pipeline::zrem(std::string_view key, std::string_view member) -> Pipeline& {
-  auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::ZSet) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-  auto const old_score = get_zset_member_score_cached(key, meta->version, member);
-  if (!old_score) {
-    return *this;
-  }
-
-  auto const mk = encode_zset_member_key(key, meta->version, member);
-  batch_.Delete(mk);
-  batch_.Delete(encode_zset_score_key(key, meta->version, *old_score, member));
-  zset_member_state_cache_[std::string(key)][std::string(member)] = std::nullopt;
-  meta->size--;
-  if (meta->size == 0) {
-    batch_.Delete(encode_meta_key(key));
-    auto const key_str = std::string(key);
-    meta_cache_.erase(key_str);
-    deleted_meta_cache_.insert(key_str);
-    clear_state_cache(key);
-    reset_state_cache_.insert(key_str);
-  } else {
-    db_.impl_->put_meta(batch_, key, *meta);
-    update_meta_cache(key, *meta);
-  }
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->zrem(*txn_, key, member));
 }
 
 auto EmbeddedRedis::Pipeline::lrem(std::string_view key, int64_t count, std::string_view value) -> Pipeline& {
-  auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::List) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-  if (meta->size == 0) {
-    return *this;
-  }
-
-  uint64_t const limit = (count == 0) ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(std::abs(count));
-  std::vector<uint64_t> to_delete;
-  uint64_t removed = 0;
-
-  auto const pfx = encode_list_prefix(key, meta->version);
-  rocksdb::Slice const pfx_slice(pfx);
-  auto const seq_offset = suffix_offset(key);
-
-  rocksdb::ReadOptions iter_opts;
-  iter_opts.fill_cache = false;
-  std::unique_ptr<rocksdb::Iterator> it(db_.impl_->db->NewIterator(iter_opts));
-
-  if (count >= 0) {
-    // 先頭からスキャン
-    for (it->Seek(pfx_slice); it->Valid() && removed < limit; it->Next()) {
-      auto const k = it->key();
-      if (!k.starts_with(pfx_slice)) {
-        break;
-      }
-      if (it->value().ToString() == value) {
-        auto const seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
-        to_delete.push_back(seq);
-        removed++;
-      }
-    }
-  } else {
-    // 末尾からスキャン（全件取得して逆順処理）
-    std::vector<std::pair<uint64_t, std::string>> all;
-    for (it->Seek(pfx_slice); it->Valid(); it->Next()) {
-      auto const k = it->key();
-      if (!k.starts_with(pfx_slice)) {
-        break;
-      }
-      auto const seq = read_u64be(reinterpret_cast<uint8_t const*>(k.data() + seq_offset));
-      all.emplace_back(seq, it->value().ToString());
-    }
-    for (auto rit = all.rbegin(); rit != all.rend() && removed < limit; ++rit) {
-      if (rit->second == value) {
-        to_delete.push_back(rit->first);
-        removed++;
-      }
-    }
-  }
-
-  if (to_delete.empty()) {
-    return *this;
-  }
-
-  for (auto const seq : to_delete) {
-    batch_.Delete(encode_list_key(key, meta->version, seq));
-  }
-
-  meta->size -= removed;
-  if (meta->size == 0) {
-    batch_.Delete(encode_meta_key(key));
-    auto const key_str = std::string(key);
-    meta_cache_.erase(key_str);
-    deleted_meta_cache_.insert(key_str);
-    clear_state_cache(key);
-    reset_state_cache_.insert(key_str);
-  } else {
-    db_.impl_->put_meta(batch_, key, *meta);
-    update_meta_cache(key, *meta);
-  }
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->lrem(*txn_, key, count, value));
 }
 
 auto EmbeddedRedis::Pipeline::ltrim(std::string_view key, int64_t start, int64_t stop) -> Pipeline& {
-  auto meta = get_meta_cached(key);
-  if (!meta) {
-    return *this;
-  }
-  if (meta->type != DataType::List) {
-    set_error(ErrorCode::WrongType);
-    return *this;
-  }
-
-  auto const size = static_cast<int64_t>(meta->size);
-
-  // 負のインデックスを正に変換
-  if (start < 0) start += size;
-  if (stop < 0) stop += size;
-
-  // クランプ
-  if (start < 0) start = 0;
-  if (stop >= size) stop = size - 1;
-
-  if (start > stop || size == 0) {
-    // 全削除
-    db_.impl_->erase_key_data(batch_, key, *meta);
-    auto const key_str = std::string(key);
-    meta_cache_.erase(key_str);
-    deleted_meta_cache_.insert(key_str);
-    clear_state_cache(key);
-    reset_state_cache_.insert(key_str);
-  } else {
-    auto const head = static_cast<int64_t>(meta->head_seq);
-    auto const new_head = static_cast<uint64_t>(head + start);
-    auto const new_tail = static_cast<uint64_t>(head + stop + 1); // tail_seq は次の位置
-    auto const new_size = static_cast<uint64_t>(stop - start + 1);
-
-    // 範囲外を削除
-    for (uint64_t seq = meta->head_seq; seq < new_head; ++seq) {
-      batch_.Delete(encode_list_key(key, meta->version, seq));
-    }
-    for (uint64_t seq = new_tail; seq < meta->tail_seq; ++seq) {
-      batch_.Delete(encode_list_key(key, meta->version, seq));
-    }
-
-    meta->head_seq = new_head;
-    meta->tail_seq = new_tail;
-    meta->size     = new_size;
-    db_.impl_->put_meta(batch_, key, *meta);
-    update_meta_cache(key, *meta);
-  }
-  return *this;
+  REDISMM_PIPELINE_OP(db_.impl_->ltrim(*txn_, key, start, stop));
 }
+
+#undef REDISMM_PIPELINE_OP
 
 auto EmbeddedRedis::Pipeline::exec() -> Result<void> {
   if (error_) {
-    // Clear pending operations to avoid reuse re-attempting the same batch
     auto const e = *error_;
     clear();
     return std::unexpected(e);
   }
-  if (!db_.is_open()) {
+  if (!txn_) {
     return std::unexpected(ErrorCode::RocksDBError);
   }
-  if (!db_.impl_->db->Write(db_.impl_->write_opts, &batch_).ok()) {
-    return std::unexpected(ErrorCode::RocksDBError);
-  }
+
+  auto const s = txn_->Commit();
   clear();
-  return {};
+  if (s.ok()) {
+    return {};
+  }
+  // 他スレッドと競合した場合、どの操作をやり直すかは利用者しか決められない
+  if (s.IsBusy() || s.IsTryAgain()) {
+    return std::unexpected(ErrorCode::Busy);
+  }
+  return std::unexpected(ErrorCode::RocksDBError);
 }
 
 void EmbeddedRedis::Pipeline::clear() {
-  batch_.Clear();
-  meta_cache_.clear();
-  deleted_meta_cache_.clear();
-  reset_state_cache_.clear();
-  string_state_cache_.clear();
-  hash_field_state_cache_.clear();
-  set_member_state_cache_.clear();
-  zset_member_state_cache_.clear();
   error_.reset();
+  if (!db_.is_open()) {
+    error_ = ErrorCode::RocksDBError;
+    txn_.reset();
+    return;
+  }
+  rocksdb::OptimisticTransactionOptions txn_opts;
+  txn_opts.set_snapshot = true;
+  // 既存の Transaction オブジェクトを再利用する（内部状態はリセットされる）
+  txn_.reset(db_.impl_->txn_db->BeginTransaction(db_.impl_->write_opts, txn_opts, txn_.release()));
 }
 
 } // namespace redismm
