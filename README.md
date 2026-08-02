@@ -8,6 +8,7 @@ RocksDB をストレージエンジンとして使用する、Redisライクな�
 - **永続化**: RocksDB による高信頼性ストレージ
 - **有効期限管理**: EXPIRE, TTL, PEXPIRE, PTTL, PERSIST コマンドをサポート
 - **型安全**: `std::expected` を使用したエラーハンドリング
+- **スレッドセーフ**: 1 つのインスタンスを複数スレッドから利用可能
 - **C++23**: モダン C++ 機能を活用
 
 ## 対応データ型
@@ -64,14 +65,7 @@ cmake --build build --parallel
 ## テスト実行
 
 ```bash
-./test.sh
-```
-
-または:
-
-```bash
-cd build
-ctest -V
+ctest --test-dir build -V
 ```
 
 ## 使用例
@@ -161,6 +155,30 @@ if (result) {
 }
 ```
 
+## 並行アクセス
+
+1 つの `EmbeddedRedis` インスタンスを複数スレッドから同時に使用できます。
+各操作は RocksDB の `OptimisticTransactionDB` 上のトランザクションとして実行されるため、
+`incr` やコレクションの要素数更新のような read-modify-write も不可分に適用されます。
+
+同一キーへの並行操作が競合した場合、ライブラリは内部で自動的に再実行します。
+再試行の上限に達した場合のみ `ErrorCode::Busy` を返します。
+
+```cpp
+// 4 スレッドから同時に呼んでも更新は失われない
+db.incr("counter");
+```
+
+`Pipeline` は利用者が組み立てた内容なので自動再実行はせず、競合時は `exec()` が
+`ErrorCode::Busy` を返します。積み直して再度 `exec()` してください。
+
+## 制限事項
+
+- **データ形式**: v0.1.0 とはオンディスク形式に互換性がありません（キーの曖昧さを解消するため、
+  データキーにユーザーキー長を前置する形式に変更しました）。既存の DB は再作成が必要です。
+- **`spop` / `srandmember` / `hrandfield`**: 一様乱数ではなく、内部順序の先頭要素を返します。
+- **`keys` / `randomkey`**: 全メタキーを走査するため、キー数に比例したコストがかかります。
+
 ## プロジェクト構成
 
 ```
@@ -171,12 +189,11 @@ redismm/
 ├── src/
 │   └── EmbeddedRedis.cpp  # 実装
 ├── test/
-│   └── test_embedded_redis.cpp  # テスト
+│   ├── test_embedded_redis.cpp     # テスト
+│   └── test_review_regressions.cpp # 既知の不具合の回帰テスト
 ├── main.cpp               # デモプログラム
 ├── CMakeLists.txt         # ビルド設定
-├── vcpkg.json             # 依存関係定義
-├── build.sh               # ビルドスクリプト
-└── test.sh                # テストスクリプト
+└── vcpkg.json             # 依存関係定義
 ```
 
 ## ライセンス

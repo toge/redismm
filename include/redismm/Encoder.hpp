@@ -34,6 +34,17 @@ namespace prefix {
 } // namespace prefix
 
 /**
+ * @brief データキーのヘッダ長（ユーザーキー本体を除く）
+ * @details レイアウトは ['prefix'(1)] + [keylen(4BE)] + [key] + [version(8BE)] + [suffix]。
+ *   keylen を前置することでユーザーキーの境界が一意に定まり、NUL を含むバイナリキーでも
+ *   「あるキーのプレフィックスが別のキーのプレフィックスに含まれる」曖昧さが発生しない。
+ *   これを省くと例えば "a" と "a\0\0\0\0\0\0\0\x01x" のデータ領域が重なり、
+ *   走査・範囲削除が別キーのデータを巻き込む。
+ */
+inline constexpr std::size_t kKeyLenSize  = 4; ///< ユーザーキー長フィールドのバイト数
+inline constexpr std::size_t kVersionSize = 8; ///< バージョンフィールドのバイト数
+
+/**
  * @brief メタデータのバイナリレイアウト（固定長）
  * @details
  *   [0]      Type     (1 バイト)
@@ -47,10 +58,10 @@ namespace prefix {
  *   [25..32] LastMS         (8 バイト big-endian)
  *   [33..40] LastSeq        (8 バイト big-endian)
  */
-inline constexpr std::size_t kMetaBaseSize   = 25;                        ///< 基本メタデータサイズ
-inline constexpr std::size_t kMetaExtSize    = kMetaBaseSize + 16;        ///< 拡張メタデータサイズ
-inline constexpr std::size_t kListMetaSize   = kMetaExtSize;              ///< リスト用メタデータサイズ
-inline constexpr std::size_t kStreamMetaSize = kMetaExtSize;              ///< ストリーム用メタデータサイズ
+inline constexpr std::size_t kMetaBaseSize   = 25;                 ///< 基本メタデータサイズ
+inline constexpr std::size_t kMetaExtSize    = kMetaBaseSize + 16; ///< 拡張メタデータサイズ
+inline constexpr std::size_t kListMetaSize   = kMetaExtSize;       ///< リスト用メタデータサイズ
+inline constexpr std::size_t kStreamMetaSize = kMetaExtSize;       ///< ストリーム用メタデータサイズ
 
 /** @brief メタデータ構造体 */
 struct MetaValue {
@@ -131,7 +142,7 @@ inline uint32_t read_u32be(uint8_t const* buf) {
  */
 inline auto encode_score(double score) -> std::array<uint8_t, 8> {
   auto bits = std::bit_cast<uint64_t>(score);
-  bits = (bits >> 63) ? ~bits : bits ^ (uint64_t{1} << 63);
+  bits      = (bits >> 63) ? ~bits : bits ^ (uint64_t{1} << 63);
   std::array<uint8_t, 8> out{};
   write_u64be(out.data(), bits);
   return out;
@@ -185,11 +196,11 @@ inline std::string encode_meta_key(std::string_view key) {
 
 /** @brief メタデータ構造体をバイナリ値にシリアライズする @param m メタデータ @return シリアライズ済みバイナリ */
 inline std::string encode_meta_value(MetaValue const& m) {
-  bool const ext   = (m.type == DataType::List || m.type == DataType::Stream);
-  auto const total = ext ? kMetaExtSize : kMetaBaseSize;
+  bool const  ext   = (m.type == DataType::List || m.type == DataType::Stream);
+  auto const  total = ext ? kMetaExtSize : kMetaBaseSize;
   std::string out(total, '\0');
-  auto* b = reinterpret_cast<uint8_t*>(out.data());
-  b[0] = static_cast<uint8_t>(m.type);
+  auto*       b = reinterpret_cast<uint8_t*>(out.data());
+  b[0]          = static_cast<uint8_t>(m.type);
   write_u64be(b + 1, m.expiration_ms);
   write_u64be(b + 9, m.version);
   write_u64be(b + 17, m.size);
@@ -239,8 +250,32 @@ inline std::optional<MetaValue> decode_meta_value(std::string_view data) {
 // ---- データキーエンコーダ ----
 
 /**
- * @brief 文字列データキーを生成: ['S'] + key
+ * @brief データキー共通ヘッダを書き込む: [prefix] + keylen(4BE) + key + version(8BE)
  *
+ * @param out     出力先（末尾に追記する）
+ * @param pfx     名前空間プレフィックス
+ * @param key     ユーザーキー
+ * @param version メタデータバージョン
+ */
+inline void append_key_head(std::string& out, char pfx, std::string_view key, uint64_t version) {
+  auto const base = out.size();
+  out.resize(base + 1 + kKeyLenSize);
+  out[base] = pfx;
+  write_u32be(reinterpret_cast<uint8_t*>(out.data() + base + 1), static_cast<uint32_t>(key.size()));
+  out.append(key);
+  auto const vpos = out.size();
+  out.resize(vpos + kVersionSize);
+  write_u64be(reinterpret_cast<uint8_t*>(out.data() + vpos), version);
+}
+
+/** @brief データキー共通ヘッダの長さ @param key ユーザーキー @return ヘッダ長 */
+inline std::size_t key_head_size(std::string_view key) {
+  return 1 + kKeyLenSize + key.size() + kVersionSize;
+}
+
+/**
+ * @brief 文字列データキーを生成: ['S'] + key
+ * @note 文字列は完全一致でしか引かないため、プレフィックス走査の曖昧さは生じない
  * @param key ユーザーキー
  * @return エンコード済みキー
  */
@@ -253,7 +288,7 @@ inline std::string encode_string_key(std::string_view key) {
 }
 
 /**
- * @brief ハッシュフィールドキーを生成: ['H'] + key + version(8BE) + field
+ * @brief ハッシュフィールドキーを生成: ['H'] + keylen(4BE) + key + version(8BE) + field
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -262,17 +297,14 @@ inline std::string encode_string_key(std::string_view key) {
  */
 inline std::string encode_hash_key(std::string_view key, uint64_t version, std::string_view field) {
   std::string out;
-  out.reserve(1 + key.size() + 8 + field.size());
-  out.push_back(prefix::Hash);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key) + field.size());
+  append_key_head(out, prefix::Hash, key, version);
   out.append(field);
   return out;
 }
 
 /**
- * @brief ハッシュ走査用プレフィックスキー: ['H'] + key + version(8BE)
+ * @brief ハッシュ走査用プレフィックスキー: ['H'] + keylen(4BE) + key + version(8BE)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -280,16 +312,13 @@ inline std::string encode_hash_key(std::string_view key, uint64_t version, std::
  */
 inline std::string encode_hash_prefix(std::string_view key, uint64_t version) {
   std::string out;
-  out.reserve(1 + key.size() + 8);
-  out.push_back(prefix::Hash);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key));
+  append_key_head(out, prefix::Hash, key, version);
   return out;
 }
 
 /**
- * @brief リスト要素キーを生成: ['L'] + key + version(8BE) + index(8BE)
+ * @brief リスト要素キーを生成: ['L'] + keylen(4BE) + key + version(8BE) + index(8BE)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -298,19 +327,16 @@ inline std::string encode_hash_prefix(std::string_view key, uint64_t version) {
  */
 inline std::string encode_list_key(std::string_view key, uint64_t version, uint64_t index) {
   std::string out;
-  out.reserve(1 + key.size() + 16);
-  out.push_back(prefix::List);
-  out.append(key);
-  out.resize(out.size() + 16);
-
-  auto* b = reinterpret_cast<uint8_t*>(out.data() + 1 + key.size());
-  write_u64be(b, version);
-  write_u64be(b + 8, index);
+  out.reserve(key_head_size(key) + 8);
+  append_key_head(out, prefix::List, key, version);
+  auto const pos = out.size();
+  out.resize(pos + 8);
+  write_u64be(reinterpret_cast<uint8_t*>(out.data() + pos), index);
   return out;
 }
 
 /**
- * @brief リスト走査用プレフィックスキー: ['L'] + key + version(8BE)
+ * @brief リスト走査用プレフィックスキー: ['L'] + keylen(4BE) + key + version(8BE)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -318,16 +344,13 @@ inline std::string encode_list_key(std::string_view key, uint64_t version, uint6
  */
 inline std::string encode_list_prefix(std::string_view key, uint64_t version) {
   std::string out;
-  out.reserve(1 + key.size() + 8);
-  out.push_back(prefix::List);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key));
+  append_key_head(out, prefix::List, key, version);
   return out;
 }
 
 /**
- * @brief セットメンバーキーを生成: ['E'] + key + version(8BE) + member
+ * @brief セットメンバーキーを生成: ['E'] + keylen(4BE) + key + version(8BE) + member
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -336,17 +359,14 @@ inline std::string encode_list_prefix(std::string_view key, uint64_t version) {
  */
 inline std::string encode_set_key(std::string_view key, uint64_t version, std::string_view member) {
   std::string out;
-  out.reserve(1 + key.size() + 8 + member.size());
-  out.push_back(prefix::Set);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key) + member.size());
+  append_key_head(out, prefix::Set, key, version);
   out.append(member);
   return out;
 }
 
 /**
- * @brief セット走査用プレフィックスキー: ['E'] + key + version(8BE)
+ * @brief セット走査用プレフィックスキー: ['E'] + keylen(4BE) + key + version(8BE)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -354,16 +374,13 @@ inline std::string encode_set_key(std::string_view key, uint64_t version, std::s
  */
 inline std::string encode_set_prefix(std::string_view key, uint64_t version) {
   std::string out;
-  out.reserve(1 + key.size() + 8);
-  out.push_back(prefix::Set);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key));
+  append_key_head(out, prefix::Set, key, version);
   return out;
 }
 
 /**
- * @brief ZSet メンバー→スコアキーを生成: ['Z'] + key + version(8BE) + member → value: score(8BE エンコード)
+ * @brief ZSet メンバー→スコアキーを生成: ['Z'] + keylen(4BE) + key + version(8BE) + member → value: score(8BE エンコード)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -372,17 +389,14 @@ inline std::string encode_set_prefix(std::string_view key, uint64_t version) {
  */
 inline std::string encode_zset_member_key(std::string_view key, uint64_t version, std::string_view member) {
   std::string out;
-  out.reserve(1 + key.size() + 8 + member.size());
-  out.push_back(prefix::ZSetMember);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key) + member.size());
+  append_key_head(out, prefix::ZSetMember, key, version);
   out.append(member);
   return out;
 }
 
 /**
- * @brief ZSet メンバー走査用プレフィックス: ['Z'] + key + version(8BE)
+ * @brief ZSet メンバー走査用プレフィックス: ['Z'] + keylen(4BE) + key + version(8BE)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -390,16 +404,13 @@ inline std::string encode_zset_member_key(std::string_view key, uint64_t version
  */
 inline std::string encode_zset_member_prefix(std::string_view key, uint64_t version) {
   std::string out;
-  out.reserve(1 + key.size() + 8);
-  out.push_back(prefix::ZSetMember);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key));
+  append_key_head(out, prefix::ZSetMember, key, version);
   return out;
 }
 
 /**
- * @brief ZSet スコア→メンバー逆引きキーを生成: ['W'] + key + version(8BE) + score(8BE) + member → value: 空
+ * @brief ZSet スコア→メンバー逆引きキーを生成: ['W'] + keylen(4BE) + key + version(8BE) + score(8BE) + member
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -408,20 +419,17 @@ inline std::string encode_zset_member_prefix(std::string_view key, uint64_t vers
  * @return エンコード済みキー
  */
 inline std::string encode_zset_score_key(std::string_view key, uint64_t version, double score, std::string_view member) {
-  auto const sb = encode_score(score);
+  auto const  sb = encode_score(score);
   std::string out;
-  out.reserve(1 + key.size() + 8 + 8 + member.size());
-  out.push_back(prefix::ZSetScore);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key) + 8 + member.size());
+  append_key_head(out, prefix::ZSetScore, key, version);
   out.append(reinterpret_cast<char const*>(sb.data()), 8);
   out.append(member);
   return out;
 }
 
 /**
- * @brief ZSet スコア範囲走査用プレフィックス: ['W'] + key + version(8BE)
+ * @brief ZSet スコア範囲走査用プレフィックス: ['W'] + keylen(4BE) + key + version(8BE)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -429,16 +437,13 @@ inline std::string encode_zset_score_key(std::string_view key, uint64_t version,
  */
 inline std::string encode_zset_score_range_prefix(std::string_view key, uint64_t version) {
   std::string out;
-  out.reserve(1 + key.size() + 8);
-  out.push_back(prefix::ZSetScore);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key));
+  append_key_head(out, prefix::ZSetScore, key, version);
   return out;
 }
 
 /**
- * @brief スコア範囲シーク用キーを生成: ['W'] + key + version(8BE) + score(8BE)
+ * @brief スコア範囲シーク用キーを生成: ['W'] + keylen(4BE) + key + version(8BE) + score(8BE)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -446,19 +451,16 @@ inline std::string encode_zset_score_range_prefix(std::string_view key, uint64_t
  * @return シークキー
  */
 inline std::string encode_zset_score_seek_key(std::string_view key, uint64_t version, double score) {
-  auto const sb = encode_score(score);
+  auto const  sb = encode_score(score);
   std::string out;
-  out.reserve(1 + key.size() + 8 + 8);
-  out.push_back(prefix::ZSetScore);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key) + 8);
+  append_key_head(out, prefix::ZSetScore, key, version);
   out.append(reinterpret_cast<char const*>(sb.data()), 8);
   return out;
 }
 
 /**
- * @brief ストリームエントリキーを生成: ['R'] + key + version(8BE) + ms(8BE) + seq(8BE)
+ * @brief ストリームエントリキーを生成: ['R'] + keylen(4BE) + key + version(8BE) + ms(8BE) + seq(8BE)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -468,19 +470,18 @@ inline std::string encode_zset_score_seek_key(std::string_view key, uint64_t ver
  */
 inline std::string encode_stream_key(std::string_view key, uint64_t version, uint64_t ms, uint64_t seq) {
   std::string out;
-  out.reserve(1 + key.size() + 24);
-  out.push_back(prefix::Stream);
-  out.append(key);
-  out.resize(out.size() + 24);
-  auto* b = reinterpret_cast<uint8_t*>(out.data() + 1 + key.size());
-  write_u64be(b, version);
-  write_u64be(b + 8, ms);
-  write_u64be(b + 16, seq);
+  out.reserve(key_head_size(key) + 16);
+  append_key_head(out, prefix::Stream, key, version);
+  auto const pos = out.size();
+  out.resize(pos + 16);
+  auto* b = reinterpret_cast<uint8_t*>(out.data() + pos);
+  write_u64be(b, ms);
+  write_u64be(b + 8, seq);
   return out;
 }
 
 /**
- * @brief ストリーム走査用プレフィックスキー: ['R'] + key + version(8BE)
+ * @brief ストリーム走査用プレフィックスキー: ['R'] + keylen(4BE) + key + version(8BE)
  *
  * @param key ユーザーキー
  * @param version メタデータバージョン
@@ -488,28 +489,32 @@ inline std::string encode_stream_key(std::string_view key, uint64_t version, uin
  */
 inline std::string encode_stream_prefix(std::string_view key, uint64_t version) {
   std::string out;
-  out.reserve(1 + key.size() + 8);
-  out.push_back(prefix::Stream);
-  out.append(key);
-  out.resize(out.size() + 8);
-  write_u64be(reinterpret_cast<uint8_t*>(out.data() + 1 + key.size()), version);
+  out.reserve(key_head_size(key));
+  append_key_head(out, prefix::Stream, key, version);
   return out;
 }
 
 // ---- フィールド/メンバー抽出 ----
 
 /**
- * @brief エンコード済みキーからユーザーキーとバージョン以降のサフィックス（フィールド/メンバー）を切り出す
+ * @brief エンコード済みキーのうち、フィールド／メンバー／シーケンスが始まるオフセット
+ *
+ * @param user_key   ユーザーキー
+ * @param prefix_len プレフィックス長（1 バイト）
+ * @return サフィックス開始オフセット
+ */
+inline std::size_t suffix_offset(std::string_view user_key, std::size_t prefix_len = 1) {
+  return prefix_len + kKeyLenSize + user_key.size() + kVersionSize;
+}
+
+/**
+ * @brief エンコード済みキーからサフィックス（フィールド/メンバー）を切り出す
  *
  * @param encoded_key エンコード済みキー全体
  * @param prefix_len  プレフィックス長（1 バイト）
  * @param user_key    ユーザーキー
  * @return サフィックス部分。範囲外の場合は空文字列
  */
-inline std::size_t suffix_offset(std::string_view user_key, std::size_t prefix_len = 1) {
-  return prefix_len + user_key.size() + 8;
-}
-
 inline std::string_view extract_suffix(std::string_view encoded_key, std::size_t prefix_len, std::string_view user_key) {
   auto const offset = suffix_offset(user_key, prefix_len);
   if (encoded_key.size() <= offset) {
