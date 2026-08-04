@@ -1,10 +1,13 @@
-#include "redismm/EmbeddedRedis.hpp"
+#include "redismm/RedisStore.hpp"
 
 #include <filesystem>
 #include <iostream>
 #include <print>
 
 namespace {
+
+// バックエンドの選択はこの 1 行で切り替える（例: 将来は redismm::RedisClient）
+using Store = redismm::EmbeddedRedis;
 
 /**
  * @brief 簡易チェック関数
@@ -37,7 +40,7 @@ auto ok(redismm::Result<T> const& r) -> bool {
  *
  * @param db データベースインスタンス
  */
-void test_strings(redismm::EmbeddedRedis& db) {
+void test_strings(Store& db) {
   std::println("\n=== Strings ===");
 
   std::ignore = db.set("name", "Alice");
@@ -62,7 +65,7 @@ void test_strings(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_hashes(redismm::EmbeddedRedis& db) {
+void test_hashes(Store& db) {
   std::println("\n=== Hashes ===");
 
   auto r1 = db.hset("user:1", "name", "Alice");
@@ -89,7 +92,7 @@ void test_hashes(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_lists(redismm::EmbeddedRedis& db) {
+void test_lists(Store& db) {
   std::println("\n=== Lists ===");
 
   auto r1 = db.rpush("queue", "a");
@@ -121,7 +124,7 @@ void test_lists(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_sets(redismm::EmbeddedRedis& db) {
+void test_sets(Store& db) {
   std::println("\n=== Sets ===");
 
   auto a1 = db.sadd("tags", "cpp");
@@ -140,7 +143,7 @@ void test_sets(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_zsets(redismm::EmbeddedRedis& db) {
+void test_zsets(Store& db) {
   std::println("\n=== Sorted Sets ===");
 
   std::ignore = db.zadd("scores", 1.5, "Alice");
@@ -166,7 +169,7 @@ void test_zsets(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_streams(redismm::EmbeddedRedis& db) {
+void test_streams(Store& db) {
   std::println("\n=== Streams ===");
 
   auto id1 = db.xadd("events", "*", {{"type", "login"}, {"user", "Alice"}});
@@ -190,7 +193,7 @@ void test_streams(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_generic(redismm::EmbeddedRedis& db) {
+void test_generic(Store& db) {
   std::println("\n=== Generic ===");
 
   std::ignore = db.set("del_me", "value");
@@ -217,7 +220,7 @@ void test_generic(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_expire(redismm::EmbeddedRedis& db) {
+void test_expire(Store& db) {
   std::println("\n=== Expire ===");
 
   std::ignore = db.set("temp_key", "temp_value");
@@ -255,7 +258,7 @@ void test_expire(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_list_ops(redismm::EmbeddedRedis& db) {
+void test_list_ops(Store& db) {
   std::println("\n=== List Operations ===");
 
   std::ignore = db.rpush("mylist", "a");
@@ -295,7 +298,7 @@ void test_list_ops(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_set_ops(redismm::EmbeddedRedis& db) {
+void test_set_ops(Store& db) {
   std::println("\n=== Set Operations ===");
 
   std::ignore = db.sadd("myset", "a");
@@ -317,7 +320,7 @@ void test_set_ops(redismm::EmbeddedRedis& db) {
  *
  * @param db データベースインスタンス
  */
-void test_pipeline(redismm::EmbeddedRedis& db) {
+void test_pipeline(Store& db) {
   std::println("\n=== Pipeline ===");
 
   auto pipe = db.pipeline();
@@ -365,7 +368,7 @@ int main() {
   std::filesystem::remove_all(db_path);
 
   std::println("Opening EmbeddedRedis at {}", db_path.string());
-  redismm::EmbeddedRedis db(db_path.string());
+  Store db = redismm::make_store(redismm::EmbeddedConfig{db_path.string()});
 
   if (!db.is_open()) {
     std::cerr << "Failed to open database\n";

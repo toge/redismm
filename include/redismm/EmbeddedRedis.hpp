@@ -38,6 +38,16 @@ enum class InsertPosition { Before, After };
 enum class ListSide { Left, Right };
 
 /**
+ * @brief 書き込み操作をまとめる Pipeline のプライマリテンプレート
+ * @details 各バックエンドが自身の実装で特殊化する。
+ *   EmbeddedRedis は RocksDB トランザクション、将来のネットワーククライアントは
+ *   パイプライン/MULTI バッファを内部に持つ想定。ユーザーコードは型名を知らずに
+ *   `auto pipe = db.pipeline();` と使う。
+ */
+template <typename Store>
+class Pipeline;
+
+/**
  * @brief Redis 互換のインメモリ操作を提供する組み込み Key-Value ストア
  * @details RocksDB をストレージエンジンとして使用し、文字列・ハッシュ・リスト・セット・
  *   ソート済みセット・ストリームの 6 データ型をサポートする。
@@ -880,7 +890,8 @@ public:
 
   // ---- Pipeline ----
 
-  class Pipeline;
+  /** @brief 本バックエンド用の Pipeline 実装（EmbeddedRedis 特殊化） */
+  using Pipeline = ::redismm::Pipeline<EmbeddedRedis>;
 
   /**
    * @brief Pipeline を作成する
@@ -890,6 +901,7 @@ public:
   auto pipeline() -> Pipeline;
 
 private:
+  template <typename> friend class ::redismm::Pipeline;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
@@ -916,7 +928,8 @@ namespace redismm {
  * @note コミット時に他スレッドと競合した場合は ErrorCode::Busy を返す。
  *   Pipeline は利用者が組み立てた内容なので自動では再実行しない。
  */
-class EmbeddedRedis::Pipeline {
+template <>
+class Pipeline<EmbeddedRedis> {
 public:
   explicit Pipeline(EmbeddedRedis& db);
   ~Pipeline();

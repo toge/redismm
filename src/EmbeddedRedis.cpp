@@ -3657,7 +3657,7 @@ auto EmbeddedRedis::pipeline() -> Pipeline {
  * @note DB が開けていない場合はトランザクションを持たず、以降の操作は何もしない。
  *   exec() は RocksDBError を返す（以前は null 参照でクラッシュしていた）。
  */
-EmbeddedRedis::Pipeline::Pipeline(EmbeddedRedis& db) : db_(db) {
+Pipeline<EmbeddedRedis>::Pipeline(EmbeddedRedis& db) : db_(db) {
   if (!db_.is_open()) {
     error_ = ErrorCode::RocksDBError;
     return;
@@ -3667,15 +3667,15 @@ EmbeddedRedis::Pipeline::Pipeline(EmbeddedRedis& db) : db_(db) {
   txn_.reset(db_.impl_->txn_db->BeginTransaction(db_.impl_->write_opts, txn_opts));
 }
 
-EmbeddedRedis::Pipeline::~Pipeline() {
+Pipeline<EmbeddedRedis>::~Pipeline() {
   if (txn_) {
     std::ignore = txn_->Rollback();
   }
 }
 
-EmbeddedRedis::Pipeline::Pipeline(Pipeline&&) noexcept = default;
+Pipeline<EmbeddedRedis>::Pipeline(Pipeline&&) noexcept = default;
 
-bool EmbeddedRedis::Pipeline::usable() const noexcept {
+bool Pipeline<EmbeddedRedis>::usable() const noexcept {
   return txn_ != nullptr && !error_;
 }
 
@@ -3694,78 +3694,78 @@ bool EmbeddedRedis::Pipeline::usable() const noexcept {
     return *this;                                                                                                      \
   } while (false)
 
-auto EmbeddedRedis::Pipeline::set(std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::set(std::string_view key, std::string_view value, std::optional<uint64_t> ttl_ms) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->set(*txn_, key, value, ttl_ms));
 }
 
-auto EmbeddedRedis::Pipeline::hset(std::string_view key, std::string_view field, std::string_view value) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::hset(std::string_view key, std::string_view field, std::string_view value) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->hset(*txn_, key, field, value));
 }
 
-auto EmbeddedRedis::Pipeline::lpush(std::string_view key, std::string_view value) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::lpush(std::string_view key, std::string_view value) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->lpush(*txn_, key, value));
 }
 
-auto EmbeddedRedis::Pipeline::rpush(std::string_view key, std::string_view value) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::rpush(std::string_view key, std::string_view value) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->rpush(*txn_, key, value));
 }
 
-auto EmbeddedRedis::Pipeline::sadd(std::string_view key, std::string_view member) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::sadd(std::string_view key, std::string_view member) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->sadd(*txn_, key, member));
 }
 
-auto EmbeddedRedis::Pipeline::srem(std::string_view key, std::string_view member) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::srem(std::string_view key, std::string_view member) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->srem(*txn_, key, member));
 }
 
-auto EmbeddedRedis::Pipeline::zadd(std::string_view key, double score, std::string_view member) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::zadd(std::string_view key, double score, std::string_view member) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->zadd(*txn_, key, score, member));
 }
 
-auto EmbeddedRedis::Pipeline::xadd(std::string_view key, std::string_view id,
+auto Pipeline<EmbeddedRedis>::xadd(std::string_view key, std::string_view id,
                                    std::vector<std::pair<std::string, std::string>> const& fields) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->xadd(*txn_, key, id, fields));
 }
 
-auto EmbeddedRedis::Pipeline::del(std::string_view key) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::del(std::string_view key) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->del(*txn_, key));
 }
 
-auto EmbeddedRedis::Pipeline::expire(std::string_view key, uint64_t seconds) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::expire(std::string_view key, uint64_t seconds) -> Pipeline& {
   return pexpire(key, seconds * 1000);
 }
 
-auto EmbeddedRedis::Pipeline::pexpire(std::string_view key, uint64_t milliseconds) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::pexpire(std::string_view key, uint64_t milliseconds) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->pexpire(*txn_, key, milliseconds));
 }
 
-auto EmbeddedRedis::Pipeline::persist(std::string_view key) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::persist(std::string_view key) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->persist(*txn_, key));
 }
 
-auto EmbeddedRedis::Pipeline::append(std::string_view key, std::string_view value) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::append(std::string_view key, std::string_view value) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->append(*txn_, key, value));
 }
 
-auto EmbeddedRedis::Pipeline::hdel(std::string_view key, std::string_view field) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::hdel(std::string_view key, std::string_view field) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->hdel(*txn_, key, field));
 }
 
-auto EmbeddedRedis::Pipeline::zrem(std::string_view key, std::string_view member) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::zrem(std::string_view key, std::string_view member) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->zrem(*txn_, key, member));
 }
 
-auto EmbeddedRedis::Pipeline::lrem(std::string_view key, int64_t count, std::string_view value) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::lrem(std::string_view key, int64_t count, std::string_view value) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->lrem(*txn_, key, count, value));
 }
 
-auto EmbeddedRedis::Pipeline::ltrim(std::string_view key, int64_t start, int64_t stop) -> Pipeline& {
+auto Pipeline<EmbeddedRedis>::ltrim(std::string_view key, int64_t start, int64_t stop) -> Pipeline& {
   REDISMM_PIPELINE_OP(db_.impl_->ltrim(*txn_, key, start, stop));
 }
 
 #undef REDISMM_PIPELINE_OP
 
-auto EmbeddedRedis::Pipeline::exec() -> Result<void> {
+auto Pipeline<EmbeddedRedis>::exec() -> Result<void> {
   if (error_) {
     auto const e = *error_;
     clear();
@@ -3787,7 +3787,7 @@ auto EmbeddedRedis::Pipeline::exec() -> Result<void> {
   return std::unexpected(ErrorCode::RocksDBError);
 }
 
-void EmbeddedRedis::Pipeline::clear() {
+void Pipeline<EmbeddedRedis>::clear() {
   error_.reset();
   if (!db_.is_open()) {
     error_ = ErrorCode::RocksDBError;
